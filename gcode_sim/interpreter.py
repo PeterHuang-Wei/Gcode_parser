@@ -14,14 +14,27 @@ statements to accept variable/expression-valued addresses (manual 16.1
 "變量的引用"), since a called macro is otherwise unable to actually move
 anything with its arguments.
 
-Canned cycles and tool compensation are not supported yet; encountering
-their G-codes raises UnsupportedFeatureError rather than being silently
-ignored or misinterpreted.
+Phase 3 adds G32 (direct thread cutting -- just a G01-shaped motion
+marked kind="thread") and the single-form canned cycles G90/G92/G94
+(canned_cycles/turning.py, canned_cycles/threading.py). These are
+01-group modal like G00-G03, but G90/G92/G94 additionally carry their
+own X(U)/Z(W)/R/F parameters modally -- a block that omits them reuses
+the last-given values, and a block with *no* motion address at all
+(even a bare M-code) still re-triggers the cycle while one of these
+G-codes is active (manual 4.1.6's "沒有移動指令的程序段" -- this is
+intentional, not a bug, and is exactly the surprising behavior the
+manual warns users to guard against with an explicit G00/G01 first).
+
+Compound canned cycles (G70-G76) and tool compensation are not
+supported yet; encountering their G-codes raises UnsupportedFeatureError
+rather than being silently ignored or misinterpreted.
 """
 
 from dataclasses import dataclass
 
 from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
+from .canned_cycles import threading as thread_cycles
+from .canned_cycles import turning
 from .errors import MacroError, ParseError, UnsupportedFeatureError
 from .expression import eval_condition, eval_expr
 from .lexer import Word
@@ -37,9 +50,13 @@ from .variables import (
     VariableStore,
 )
 
-# 01-group (motion) G-codes implemented in Phase 0. G32/G90/G92/G94/G70-76
-# are recognized (see UNSUPPORTED_G) but arrive in Phase 3/4.
-PHASE0_MOTION_G = {0.0, 1.0, 2.0, 3.0}
+# 01-group G-codes that are simple, single-block motions (no separate
+# retract legs): G00/G01/G02/G03 from Phase 0, plus G32 thread cutting.
+SIMPLE_MOTION_G = {0.0, 1.0, 2.0, 3.0, 32.0}
+
+# 01-group G-codes that are 4-leg canned cycles carrying their own modal
+# X(U)/Z(W)/R/F state (see module docstring).
+CANNED_CYCLE_G = {90.0, 92.0, 94.0}
 
 # G-codes that are parsed but have no effect on the toolpath in this
 # simulator: plane selection (always ZX), tool-comp mode flag (real
@@ -53,15 +70,13 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 # produce a wrong path, not just missing metadata.
 UNSUPPORTED_G = {
     28.0, 30.0,  # reference point return
-    32.0,  # thread cutting
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
     70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0,  # compound canned cycles
-    90.0, 92.0, 94.0,  # single-form canned cycles
 }
 
 END_PROGRAM_M = {2.0, 30.0}
 
-KIND_FOR_MOTION_G = {0.0: "rapid", 1.0: "linear", 2.0: "arc", 3.0: "arc"}
+KIND_FOR_MOTION_G = {0.0: "rapid", 1.0: "linear", 2.0: "arc", 3.0: "arc", 32.0: "thread"}
 
 # G65 argument address -> local variable number, "type I" form (manual
 # 16.7.1). G, L, N, O, P are never valid argument addresses.
@@ -95,6 +110,13 @@ class ModalState:
     pos: Point = (0.0, 0.0)  # (z, x), x in radius units
     tool: str | None = None
     max_spindle_rpm: float | None = None
+    # Modal parameters for the currently-active canned cycle (G90/G92/
+    # G94). Cleared whenever motion_g changes to a *different* value (see
+    # _apply_g_codes); persist across blocks that omit them otherwise.
+    cycle_x: float | None = None
+    cycle_z: float | None = None
+    cycle_r: float = 0.0
+    cycle_f: float | None = None
 
 
 class Interpreter:
@@ -353,7 +375,7 @@ class Interpreter:
             self._apply_g50(by_addr)
             return  # X/Z in a G50 block declare a coordinate, they don't move the tool
 
-        self._apply_motion(stmt, by_addr)
+        self._dispatch_motion(stmt, by_addr)
 
     def _apply_g_codes(self, g_words: list[ResolvedWord]) -> None:
         for rw in g_words:
@@ -362,7 +384,17 @@ class Interpreter:
                 self.state.unit_scale = 25.4
             elif code == 21.0:
                 self.state.unit_scale = 1.0
-            elif code in PHASE0_MOTION_G:
+            elif code in SIMPLE_MOTION_G or code in CANNED_CYCLE_G:
+                if code != self.state.motion_g:
+                    # switching to a different 01-group code clears the
+                    # canned cycle's modal X(U)/Z(W)/R/F state (manual
+                    # 4.1.6) -- re-affirming the *same* code must not
+                    # clear it, or the whole point of the modal carry
+                    # (only giving a fresh U each pass) would break.
+                    self.state.cycle_x = None
+                    self.state.cycle_z = None
+                    self.state.cycle_r = 0.0
+                    self.state.cycle_f = None
                 self.state.motion_g = code
             elif code in INERT_G:
                 continue
@@ -383,19 +415,29 @@ class Interpreter:
         if "S" in by_addr:
             self.state.max_spindle_rpm = by_addr["S"][0].value
 
-    def _apply_motion(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+    def _dispatch_motion(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if self.state.motion_g in CANNED_CYCLE_G:
+            # A canned cycle re-triggers on *every* subsequent block while
+            # active, even one with no motion address at all (manual
+            # 4.1.6) -- so this check happens before the "any motion
+            # word?" early-out below, which only applies to simple motion.
+            self._apply_canned_cycle(stmt, by_addr)
+            return
+
         if not any(a in by_addr for a in ("X", "Z", "U", "W")):
             return
         if self.state.motion_g is None:
             raise ParseError(
                 f"line {stmt.line_no}: motion word given before any motion G-code was specified"
             )
-        if self.state.motion_g not in PHASE0_MOTION_G:
+        if self.state.motion_g not in SIMPLE_MOTION_G:
             raise UnsupportedFeatureError(
                 f"line {stmt.line_no}: modal G-code G{self.state.motion_g:g} is not "
-                "a Phase 0 motion code"
+                "a supported motion code"
             )
+        self._apply_simple_motion(stmt, by_addr)
 
+    def _apply_simple_motion(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
         start = self.state.pos
         end = self._resolve_end_point(stmt, by_addr, start)
         kind = KIND_FOR_MOTION_G[self.state.motion_g]
@@ -416,6 +458,53 @@ class Interpreter:
 
         self.toolpath.append(move)
         self.state.pos = end
+
+    def _apply_canned_cycle(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "Z" in by_addr:
+            self.state.cycle_z = to_internal_length("Z", by_addr["Z"][0].value, unit_scale=self.state.unit_scale)
+        elif "W" in by_addr:
+            self.state.cycle_z = self.state.pos[0] + to_internal_length(
+                "W", by_addr["W"][0].value, unit_scale=self.state.unit_scale
+            )
+        if "X" in by_addr:
+            self.state.cycle_x = to_internal_length("X", by_addr["X"][0].value, unit_scale=self.state.unit_scale)
+        elif "U" in by_addr:
+            self.state.cycle_x = self.state.pos[1] + to_internal_length(
+                "U", by_addr["U"][0].value, unit_scale=self.state.unit_scale
+            )
+        if "R" in by_addr:
+            self.state.cycle_r = to_internal_length("R", by_addr["R"][0].value, unit_scale=self.state.unit_scale)
+        if "F" in by_addr:
+            self.state.cycle_f = by_addr["F"][0].value
+
+        if self.state.cycle_x is None or self.state.cycle_z is None:
+            raise ParseError(
+                f"line {stmt.line_no}: canned cycle G{self.state.motion_g:g} has no "
+                "X(U)/Z(W) target yet (none given in this or any prior block)"
+            )
+
+        start = self.state.pos
+        code = self.state.motion_g
+        if code == 90.0:
+            moves = turning.expand_g90(
+                start, self.state.cycle_x, self.state.cycle_z, self.state.cycle_r, self.state.cycle_f, stmt.line_no
+            )
+        elif code == 94.0:
+            moves = turning.expand_g94(
+                start, self.state.cycle_x, self.state.cycle_z, self.state.cycle_r, self.state.cycle_f, stmt.line_no
+            )
+        elif code == 92.0:
+            moves = thread_cycles.expand_g92(
+                start, self.state.cycle_x, self.state.cycle_z, self.state.cycle_r, self.state.cycle_f, stmt.line_no
+            )
+        else:
+            raise UnsupportedFeatureError(f"G{code:g} canned cycle is not implemented")
+
+        for m in moves:
+            m.tool = self.state.tool
+            self.toolpath.append(m)
+        if moves:
+            self.state.pos = moves[-1].end
 
     def _resolve_end_point(
         self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]], start: Point
