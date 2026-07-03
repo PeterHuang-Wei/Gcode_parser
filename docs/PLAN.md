@@ -57,13 +57,17 @@ Gcode_parser/
     viewer.js
     viewer.css
   tests/
-    fixtures/             # 手冊範例程式（見第6節）
+    fixtures/             # 手冊範例程式（黃金測試，見第10節）
     test_lexer.py
     test_expression.py
     test_variables.py
     test_control_flow.py
     test_macro_call.py
     test_interpolation.py
+    test_units.py           # 各循環Δ參數的直徑/半徑、正負號對照表測試
+    test_tool_table.py
+    test_program_registry.py
+    test_errors.py
     test_canned_cycles/
       test_g71.py
       test_g72.py
@@ -79,8 +83,9 @@ Gcode_parser/
     06_g76_thread.nc
   docs/
     PLAN.md               # 本文件
-    grammar.md            # G-code / 宏語法的正式文法（BNF）
-    variables.md           # 變量對應表、系統變量支援清單
+    grammar.md            # G-code / 宏語法的正式文法（BNF）— 排入 Phase 0/1，見第11節
+    variables.md           # 變量對應表、系統變量支援清單 — 排入 Phase 1，見第11節
+    program_registry.md    # O 號程式查找的簡化假設說明 — 排入 Phase 1，見第11節
 ```
 
 ## 3. 解析流程（Lexer → Parser → AST）
@@ -133,7 +138,12 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
 | 公共變量（易失） | `#100~#199` | 全域，關機（模擬開始）清除 | 讀/寫 |
 | 公共變量（保持） | `#500~#999` | 全域，跨程式保留 | 讀/寫（可設唯讀範圍） |
 | 系統變量 | `#1000+` | 依變量號固定用途 | 依變量而定 |
-| 空值 | `#0`、`#3100` | 永遠是空值 | 唯讀 |
+
+注意：`#0` 與 `#3100` 不是獨立於上表之外的第五類，`#0` 落在局部變量的
+編號範圍、`#3100` 落在系統變量的編號範圍，兩者都只是「該範圍內被特別
+硬編碼為永遠空值、唯讀」的兩個特例變量號，而非另一個並列的分類。
+實作上以 `VariableStack`/系統變量查表中對這兩個號碼的特殊處理來達成，
+不需要另一個「空值類別」的資料結構。
 
 - `EmptyValue` sentinel：依 16.1「未定義變量」表格實作 EQ/NE 與
   GE/GT/LE/LT 對空值的不同判定邏輯。
@@ -226,7 +236,7 @@ N033 U-32.0;
 指定 01組（motion group）其他 G 代碼（如 G00/G01）會清除這個模態值。
 `ModalState` 必須把這組循環參數視為獨立的「目前生效循環」狀態，而非
 每個 block 各自獨立解析——這是正確性關鍵，不是次要細節，需要在
-`turning.py`/`threading.py` 的黃金測試中專門覆蓋（見第13節第2點）。
+`turning.py`/`threading.py` 的黃金測試中專門覆蓋（見第13節第11點）。
 
 ## 8. 刀具路徑資料結構（toolpath.py）
 
@@ -254,7 +264,12 @@ class Move:
 class Toolpath:
     moves: list[Move]
     diameter_programming: bool = True  # X 為直徑值（手冊預設）
+```
 
+`ToolEntry`/`ToolTable` 定義在 `tool_table.py`（見第2節專案結構），非本檔：
+
+```python
+# tool_table.py
 @dataclass
 class ToolEntry:
     tool_no: str          # 如 "01"（T0101 的前兩碼）
@@ -266,6 +281,9 @@ class ToolTable(dict[str, ToolEntry]):
     """key 為完整刀號字串（如 "0101"）。Phase 0 只需能存取/查詢，
     不強制每個 T 代碼都要先註冊，缺項時視為 nose_radius=0。"""
 ```
+
+`Move.tool` 只存刀號字串（如 `"0101"`），實際查表時透過 `ToolTable` 取得
+`ToolEntry`，`toolpath.py` 不重複定義刀具相關類別。
 
 - X 軸依手冊註記預設為**直徑編程**（圖中以 X/2 換算半徑），提供設定切換
   半徑編程。
@@ -305,12 +323,16 @@ class ToolTable(dict[str, ToolEntry]):
 
 - **Phase 0** 專案骨架：lexer + 純 NC 語句 parser（不含宏）+ G00/G01/G02/G03
   插補 + **G50 座標設定** + 最小 `ToolTable`（先允許留白）+ matplotlib
-  靜態繪圖。`Move` dataclass 從此階段就加入 `programmed_end` 欄位（先恆
-  等於 `end`），為 Phase 4.5 預留擴充空間。用 `examples/01_basic_line_arc.nc`
-  驗證。
+  靜態繪圖 + 建立 `docs/grammar.md`（先寫 Phase 0 涵蓋的 NC 語句文法，
+  之後各 Phase 陸續擴充，不是一次寫完）。`Move` dataclass 從此階段就
+  加入 `programmed_end` 欄位（先恆等於 `end`），為 Phase 4.5 預留擴充
+  空間。用 `examples/01_basic_line_arc.nc` 驗證。
 - **Phase 1** 變量系統 + 表達式求值 + 賦值語句 + GOTO/IF/WHILE +
-  **M98 子程式調用**（不傳自變量，堆疊≤10層）
-  （先不含 G65，用直接賦值公共變量測試控制流）。
+  最小可用的 `program_registry.py`（單一登記表版本，見第13節第13點）+
+  **M98 子程式調用**（不傳自變量，堆疊≤10層，依賴上述 program_registry
+  查找 O 號程式本體）（先不含 G65，用直接賦值公共變量測試控制流）。
+  同步建立 `docs/variables.md`（變量對應表、系統變量支援清單雛形）與
+  `docs/program_registry.md`（記錄簡化假設）。
 - **Phase 2** G65 宏調用（自變量傳遞、局部變量frame、調用堆疊、巢狀限制，
   與 M98 共用 call stack 但分開計數，合計≤15層）。
   用 `examples/02_macro_sum.nc` 驗證。
