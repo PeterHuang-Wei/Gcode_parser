@@ -30,9 +30,11 @@ Gcode_parser/
     parser.py            # token → 每個程式段的 AST
     expression.py         # <表達式> 遞迴下降解析 + 求值（運算子優先序、函數）
     variables.py          # 變量儲存：局部/公共/系統變量、空值語意
-    interpreter.py         # 主執行迴圈：模態狀態、控制流、宏調用堆疊
+    interpreter.py         # 主執行迴圈：模態狀態、控制流、宏調用/子程式堆疊、G50
+    tool_table.py           # ToolEntry / ToolTable（T 代碼查詢）
     canned_cycles/
       __init__.py
+      contour.py           # 輪廓子解譯器（G70/G71/G72/G73 共用，見第7節）
       turning.py          # G90（外/內徑車削）、G94（端面車削）
       threading.py        # G32、G92（螺紋切削循環）、G76（複合型螺紋）
       roughing.py         # G71、G72（外徑/端面粗車，類型I/II）
@@ -40,8 +42,9 @@ Gcode_parser/
       finishing.py         # G70（精車）
       grooving.py          # G74、G75（端面/外徑切斷、切槽、深孔鑽）
     motion.py             # 直線/圓弧插補的幾何運算（點列生成）
-    toolpath.py            # Move / Toolpath 資料結構
-    simulator.py           # 串接 interpreter → canned_cycles → toolpath
+    tool_comp.py            # G41/G42 刀尖半徑補償（Phase 4.5）
+    toolpath.py            # Move / Toolpath / ToolTable 資料結構
+    simulator.py           # 串接 interpreter → canned_cycles → tool_comp → toolpath
     export_json.py         # toolpath → JSON（供網頁 viewer 使用）
     viz_matplotlib.py       # 離線繪圖/動畫
     cli.py                 # 指令列入口：gcode-sim run foo.nc --plot
@@ -144,6 +147,10 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
   `G90/G92/G94` 在此手冊中屬於「01組固定循環」而非銑床的絕對/增量模式；
   絕對/增量由位址決定（`X/Z` = 絕對，`U/W` = 增量），因此 ModalState 不需要
   絕對/增量旗標，改為在每個 NC 語句解析時依位址字母判斷。
+- **G50 座標設定**：`G50 X_ Z_` 不產生移動，而是把「目前刀具實際位置」
+  登記為指定的座標值，之後的絕對座標（X/Z）都以此為基準換算。實作上
+  等同於重新設定 interpreter 內部「工件座標系原點偏移量」，而非移動
+  刀具。需在 Phase 0 就支援，否則手冊範例程式的起始點會全部算錯。
 - **主迴圈**：逐 block 執行 → 若為宏語句，交給對應處理器（賦值/控制流/
   宏調用）；若為 NC 語句，更新模態群組、取出移動相關位址，交給
   `motion.py`（G00/G01/G02/G03/G32）或 `canned_cycles/*`（G90/G92/G94/
@@ -159,6 +166,10 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
   A B C D E F H I J K M Q R S T U V W X Y Z 各自對應 #1~#26 的表；
   第II類：A/B/C + 10組I/J/K）建立新的局部變量 frame，執行對應程式號的
   區塊，遇 `M99` 返回。
+- **子程式調用（M98/M代碼/T代碼/S代碼調用）**：與 G65 分開的一級功能，
+  不傳自變量、不建立新的局部變量 frame（沿用呼叫端的局部變量），僅
+  push/pop 返回位址。與宏調用共用同一個 call stack 物件，但分開計數
+  （宏調用≤5層、子程式調用≤10層、合計≤15層）。
 
 ## 7. 固定循環展開（canned_cycles/）
 
@@ -195,19 +206,37 @@ G92 → G76 → G71類型II（槽孔）→ G74/G75。理由：G90/G94/G70/G71類
 @dataclass
 class Move:
     kind: Literal["rapid", "linear", "arc", "thread"]
-    start: tuple[float, float]   # (Z, X) 依手冊慣例 X 為直徑值
+    start: tuple[float, float]   # (Z, X) 依手冊慣例 X 為直徑值；刀尖中心座標
     end: tuple[float, float]
-    feed: float | None
-    spindle: float | None
+    programmed_end: tuple[float, float] | None = None  # 編程座標（未套用刀尖
+        # 半徑補償前的目標點）。Phase 0~4 恆等於 end；Phase 4.5 導入 G41/G42
+        # 後，end 改為刀尖中心實際座標，programmed_end 保留原始編程座標，
+        # 兩者都要能查得到（除錯、對照原始程式用）。
+    feed: float | None = None
+    spindle: float | None = None
+    feed_mode: Literal["per_min", "per_rev"] | None = None   # G98/G99，僅記錄
+    spindle_mode: Literal["rpm", "css"] | None = None         # G97/G96，僅記錄
     arc_center: tuple[float, float] | None = None
     arc_ccw: bool | None = None
     source_line: int | None = None   # 對應原始程式行號，方便除錯
     cycle: str | None = None         # 產生此移動的固定循環名稱（若有）
+    tool: str | None = None          # 對應 ToolTable 的刀號（如 "0101"）
 
 @dataclass
 class Toolpath:
     moves: list[Move]
     diameter_programming: bool = True  # X 為直徑值（手冊預設）
+
+@dataclass
+class ToolEntry:
+    tool_no: str          # 如 "01"（T0101 的前兩碼）
+    offset_no: str        # 如 "01"（T0101 的後兩碼）
+    nose_radius: float = 0.0     # 刀尖半徑，Phase 0~4 預設0（無影響）
+    orientation: int = 0         # 假想刀尖方向 0~9，Phase 4.5 才用到
+
+class ToolTable(dict[str, ToolEntry]):
+    """key 為完整刀號字串（如 "0101"）。Phase 0 只需能存取/查詢，
+    不強制每個 T 代碼都要先註冊，缺項時視為 nose_radius=0。"""
 ```
 
 - X 軸依手冊註記預設為**直徑編程**（圖中以 X/2 換算半徑），提供設定切換
@@ -244,29 +273,109 @@ class Toolpath:
 ## 11. 分階段路線圖（Roadmap）
 
 - **Phase 0** 專案骨架：lexer + 純 NC 語句 parser（不含宏）+ G00/G01/G02/G03
-  插補 + matplotlib 靜態繪圖。用 `examples/01_basic_line_arc.nc` 驗證。
-- **Phase 1** 變量系統 + 表達式求值 + 賦值語句 + GOTO/IF/WHILE
+  插補 + **G50 座標設定** + 最小 `ToolTable`（先允許留白）+ matplotlib
+  靜態繪圖。`Move` dataclass 從此階段就加入 `programmed_end` 欄位（先恆
+  等於 `end`），為 Phase 4.5 預留擴充空間。用 `examples/01_basic_line_arc.nc`
+  驗證。
+- **Phase 1** 變量系統 + 表達式求值 + 賦值語句 + GOTO/IF/WHILE +
+  **M98 子程式調用**（不傳自變量，堆疊≤10層）
   （先不含 G65，用直接賦值公共變量測試控制流）。
-- **Phase 2** G65 宏調用（自變量傳遞、局部變量frame、調用堆疊、巢狀限制）。
+- **Phase 2** G65 宏調用（自變量傳遞、局部變量frame、調用堆疊、巢狀限制，
+  與 M98 共用 call stack 但分開計數，合計≤15層）。
   用 `examples/02_macro_sum.nc` 驗證。
 - **Phase 3** 單一型固定循環 G90/G92/G94、G32（含多線螺紋 Q）。
 - **Phase 4** 複合型固定循環，依第7節建議順序逐一實作（G71→G70→G72→
-  G73→G76→G74/G75）。
+  G73→G76→G74/G75）。G76 的 `P(m)(r)(a)` 位數編碼解析需獨立單元測試。
+- **Phase 4.5** 刀尖半徑補償（G41/G42）整合進固定循環與一般插補路徑，
+  含循環起點偏置取消/重新起刀的時機處理（見第13節第4點）。
 - **Phase 5** 網頁互動 viewer（JSON匯出 + Canvas）、動畫。
-- **Phase 6**（stretch）刀尖半徑補償整合、庫存材料切削模擬（stock removal，
-  多邊形布林運算視覺化材料被切除的過程）。
+- **Phase 6**（stretch）庫存材料切削模擬（stock removal，多邊形布林運算
+  視覺化材料被切除的過程）。
 
-## 12. 待確認的開放問題
+## 12. 開放問題與決議
 
-1. **系統變量支援範圍**：模擬用途下，是否需要支援刀具偏置（#2001+）、
-   工件座標系（#5201+）等，或先只做位置回讀？→ 建議先做最小集合，
-   之後依實際測試程式需求擴充。
-2. **報警碼重現程度**：是否需要模擬器輸出對應真機的 PS0xxx 報警碼
-   字串（教學用途可能有幫助），或只需一般 Python 例外訊息？
-3. **刀尖半徑補償優先度**：若近期就有需要 G41/G42 準確路徑的程式要跑，
-   建議提前到 Phase 4 之後、Phase 5 之前處理，而非放到 Phase 6。
+1. **系統變量支援範圍** → 採建議：先做最小集合（僅座標位置回讀，如
+   `#5001~#5006`），刀具偏置（#2001+）、工件座標系（#5201+）等之後依實際
+   測試程式需求再擴充，並持續更新 `docs/variables.md` 標註「已支援／
+   尚未支援」清單。
+2. **報警碼重現程度** → 採一般訊息：模擬器拋出的是一般 Python 例外
+   （如 `MacroError`、`CannedCycleError`），訊息內容可在括號中附註對應
+   手冊報警碼（例如「(cf. PS0064) 精車形狀不是單調變化」）方便對照手冊
+   除錯，但不模擬真實的報警狀態機（無需 alarm reset、SRVO 類報警等）。
+3. **刀尖半徑補償（G41/G42）優先度** → 採建議：從 Phase 6 提前到
+   Phase 4 之後、Phase 5（網頁互動視覺化）之前，獨立為 **Phase 4.5**。
+   因為這不是「加一個模組」而已，會回頭影響每個固定循環的路徑計算方式
+   （見下方第13節第4點），所以提前排定也代表 Phase 0 的資料結構需要
+   提前預留擴充空間，避免 Phase 4.5 變成大改。
+
+## 13. 補充注意事項（規劃反思）
+
+規劃初稿之外，重新檢視兩份手冊後，以下幾點容易被忽略、但會直接影響
+「能不能正確重現手冊範例程式」，特別列出：
+
+1. **G50 座標系設定指令必須支援**。手冊裡幾乎所有範例程式開頭都有
+   `G50 X220.0 Z190.0;` 這類指令——它不是移動指令，而是「宣告目前刀具
+   實際所在位置的座標值」（同時在部分規格下也設定主軸最高轉速限制，
+   此部分先忽略，僅處理座標設定語意）。若不支援，所有黃金測試範例的
+   起始座標都會算錯。**排入 Phase 0**（與 G00/G01 插補一起做），而不是
+   後面才補。
+
+2. **M98 子程式調用列為 Phase 1 就要支援的第一級功能**，不要只做 G65。
+   手冊 16.7 節明確把「宏調用（G65/G66/G66.1/G67，可傳自變量）」與
+   「子程式調用（M98/M代碼/T代碼/S代碼調用，不可傳自變量）」分成兩類。
+   許多實務程式只用 M98 做單純重複（例如同一輪廓車削N刀），沒有用到
+   變量，若只做 G65 會漏掉一大類常見程式。子程式調用堆疊（≤10層）與
+   宏調用堆疊（≤5層，合計≤15層）需要分開計數但共用同一個
+   call stack 機制。
+
+3. **T 代碼與最小刀具表**。範例程式中的 `T0101`（刀號01、補正號01）
+   目前規劃只當作中繼資料記錄，不影響路徑。但因為刀尖半徑補償
+   （G41/G42）提前到 Phase 4.5，屆時「刀尖半徑」勢必要來自某個刀具定義，
+   所以 Phase 0 就應該先建立一個簡單的 `ToolTable`（刀號 → 補正號 →
+   刀尖半徑/假想刀尖方向，先允許全部留白/預設0），避免 Phase 4.5 時
+   又要回頭改資料結構。
+
+4. **刀尖半徑補償提前後，資料結構要預留「程式路徑」與「補償後路徑」
+   分離存放**。手冊 4.1.5、4.2.1 節說明固定循環搭配 G41/G42 時，偏置
+   在循環起點會暫時取消、在下一個移動指令才重新起刀，且刀尖中心路徑
+   與編程路徑不同（見刀尖半徑中心路徑圖）。若 `Move`/`Toolpath` 一開始
+   沒有把「編程座標」與「刀尖中心座標」分開存，Phase 4.5 要疊加補償時
+   會被迫大改第7、8節已完成的固定循環模組。因此第8節的 `Move` dataclass
+   建議從 Phase 0 就加上 `programmed_end: tuple | None` 欄位（先恆等於
+   `end`），Phase 4.5 再讓補償計算填入真正偏移後的 `end`。
+
+5. **明確排除的行為（非路徑幾何，屬即時操作員介入）**：單程序段停止、
+   進給暫停（feed hold）、螺紋切削循環收回功能（4.1.2節「帶有螺紋切削
+   循環收回功能時...」）、手動干預（4.1.6節）。這些都是「操作中」的
+   即時行為，模擬器是離線跑完整支程式，不存在操作員暫停，因此**明確
+   不模擬**，並在 `docs/variables.md` 或程式碼註解中寫清楚原因，避免
+   日後被誤認為遺漏。
+
+6. **G76 的 `P(m)(r)(a)` 是位數編碼，不是一般數值**，例如
+   `P021260` = m=02（最終精加工重複次數）、r=12（螺紋倒角量，
+   1.2L）、a=60（刀尖角度60°），要用固定位數切割（2+2+2位）解析，
+   而非當成單一數字使用。這是解析階段容易犯錯的地方，需要在
+   `parser.py`／`threading.py` 加專門的單元測試覆蓋（含 `m,r,a` 用參數
+   預設值省略指定的情形）。
+
+7. **記錄但不影響路徑幾何的模態資訊**：`G96/G97`（恆線速度/恆轉速）、
+   `G98/G99`（每分鐘進給/每轉進給）、`G20/G21`（英制/公制）。這些會
+   影響動畫播放的時間感、單位換算，但不改變刀具路徑的幾何形狀。
+   規劃上把它們存成 `Move` 或 `Toolpath` 的中繼資料（`feed_mode`、
+   `spindle_mode`、`unit`），供視覺化/動畫使用，但不參與路徑計算，
+   並在文件中明講「有記錄、不影響幾何」，避免被誤以為完全忽略。
+
+8. **可選程序段跳過 `/`（block skip）先做成可關閉的設定**，預設不跳過
+   （即完整模擬全部程式），因為手冊提到 `/n`（n=1~9）不可作為變量使用，
+   代表這是獨立語法元素，需要 lexer 層識別但預設不啟用跳過行為。
+
+9. **OCR 文字需要與原圖交叉確認**。兩份手冊是透過 PDF 頁面轉文字/圖片
+   取得，部份參數預設值、範圍數字（例如報警碼、參數編號）在撰寫
+   `grammar.md`、`variables.md` 時建議保留「見手冊原圖第X頁」的註記，
+   而不是完全依賴已抄錄的文字，降低謄寫誤差風險。
 
 ---
 
-以上為架構規劃，尚未動手寫程式碼。請確認方向或提出調整，之後再依此
-文件逐階段實作。
+以上為架構規劃，尚未動手寫程式碼。待你確認本次補充後，下一步將依
+第11節路線圖從 Phase 0 開始實作（含本次新增的 G50、M98、ToolTable
+雛形）。
