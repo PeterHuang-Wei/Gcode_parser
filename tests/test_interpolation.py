@@ -109,21 +109,16 @@ def test_unsupported_canned_cycle_raises_clear_error():
         )
 
 
-def test_unsupported_subprogram_call_raises_clear_error():
-    with pytest.raises(UnsupportedFeatureError):
+def test_m98_to_undefined_program_raises_clear_error():
+    # M98/#-assignment are implemented starting Phase 1 (see
+    # test_control_flow.py / test_expression.py); this now only checks
+    # that calling a program that was never registered fails loudly.
+    from gcode_sim.errors import MacroError
+
+    with pytest.raises(MacroError):
         simulator.run(
             """
             M98 P1000;
-            M30;
-            """
-        )
-
-
-def test_macro_statement_raises_clear_error():
-    with pytest.raises(UnsupportedFeatureError):
-        simulator.run(
-            """
-            #1=100;
             M30;
             """
         )
