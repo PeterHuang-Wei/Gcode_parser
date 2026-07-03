@@ -50,9 +50,17 @@ MACRO_TOKEN_RE = re.compile(
 @dataclass
 class Word:
     address: str
-    value: str
+    value: str | None = None  # literal text, e.g. "10.0" -- set when expr is None
+    expr: object | None = None  # an ast_nodes.Expr, for #-/bracket-valued addresses
+    # (typed as `object` to avoid a lexer<->ast_nodes<->expression import
+    # cycle -- ast_nodes.py already imports Word from here)
 
     def as_float(self) -> float:
+        if self.expr is not None:
+            raise TypeError(
+                "as_float() cannot resolve an expression-valued Word without a "
+                "VariableStore -- use Interpreter._resolve_word() instead"
+            )
         return float(self.value)
 
 
