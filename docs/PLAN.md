@@ -15,9 +15,10 @@
 第一版**從一開始就納入用戶宏程序**（G65、變量、IF/WHILE），因為許多實務
 G-code（尤其是固定循環的變體與參數化程式）大量依賴宏功能。
 
-技術棧：Python。matplotlib 做離線靜態/動畫視覺化；另外把 toolpath 匯出成
-JSON，搭配一個獨立網頁（HTML+Canvas/SVG）做互動式檢視（可拖曳時間軸、
-分辨快速/切削路徑）。
+技術棧：Python。matplotlib 做離線靜態視覺化；另外把 toolpath 匯出成
+JSON，搭配一個獨立網頁（HTML+Canvas/SVG）顯示完整路徑（分辨快速/切削/
+螺紋路徑）。範圍只到「正常路徑顯示」，不含時間軸拖曳或動畫互動
+（見第9節）。
 
 ## 2. 專案結構
 
@@ -46,11 +47,16 @@ Gcode_parser/
       finishing.py         # G70（精車）
       grooving.py          # G74、G75（端面/外徑切斷、切槽、深孔鑽）
     motion.py             # 直線/圓弧插補的幾何運算（點列生成）
-    tool_comp.py            # G41/G42 刀尖半徑補償（Phase 4.5）
+    tool_comp.py            # G41/G42 刀尖半徑補償（Phase 4.5 實作，但從
+                             # Phase 0 起就被 motion.py/canned_cycles 呼叫，
+                             # 見第13節第4點）
     toolpath.py            # Move / Toolpath / ToolTable 資料結構
-    simulator.py           # 串接 interpreter → canned_cycles → tool_comp → toolpath
+    simulator.py           # 串接 interpreter →（canned_cycles/motion 內部
+                             # 呼叫 tool_comp 產生補償後座標）→ toolpath；
+                             # tool_comp 不是事後對 Move 列表做後製的獨立
+                             # 階段，見第13節第4點
     export_json.py         # toolpath → JSON（供網頁 viewer 使用）
-    viz_matplotlib.py       # 離線繪圖/動畫
+    viz_matplotlib.py       # 離線靜態繪圖（不含動畫，見第9節）
     cli.py                 # 指令列入口：gcode-sim run foo.nc --plot
   web_viewer/
     index.html            # 獨立網頁，讀取 toolpath JSON 顯示互動路徑
@@ -136,7 +142,7 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
 |---|---|---|---|
 | 局部變量 | `#1~#33` | 每次宏調用產生新的一層（stack frame） | 讀/寫 |
 | 公共變量（易失） | `#100~#199` | 全域，關機（模擬開始）清除 | 讀/寫 |
-| 公共變量（保持） | `#500~#999` | 全域，跨程式保留 | 讀/寫（可設唯讀範圍） |
+| 公共變量（保持） | `#500~#999` | 全域，除非被覆寫否則一直留著 | 讀/寫（可設唯讀範圍） |
 | 系統變量 | `#1000+` | 依變量號固定用途 | 依變量而定 |
 
 注意：`#0` 與 `#3100` 不是獨立於上表之外的第五類，`#0` 落在局部變量的
@@ -144,6 +150,16 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
 硬編碼為永遠空值、唯讀」的兩個特例變量號，而非另一個並列的分類。
 實作上以 `VariableStack`/系統變量查表中對這兩個號碼的特殊處理來達成，
 不需要另一個「空值類別」的資料結構。
+
+**「保持」的範圍只限單次模擬執行，不做跨行程/序列化持久化（已確認）**：
+`#500~#999` 在同一次 `simulator.run(...)` 呼叫期間，只要沒被程式覆寫就
+會一直留在記憶體內；v1 **不**實作寫回磁碟、跨 CLI 呼叫或跨 Python
+process 保留這些值——每次重新執行模擬器就是全新狀態（等同「重新開機」）。
+同時要注意：這批公共變量**不會**因為 G65 宏調用或 M98 子程式調用的
+push/pop 而被重置或清空——呼叫/返回只影響局部變量（`#1~#33`）的
+frame，公共變量在整個呼叫堆疊（包含巢狀的子程式與宏）之間是完全共用
+且連續的同一份記憶體，這點需要在 `test_macro_call.py` 用巢狀呼叫的
+案例明確測試（例如宏A呼叫宏B，B寫入`#500`，返回A後A仍能讀到該值）。
 
 - `EmptyValue` sentinel：依 16.1「未定義變量」表格實作 EQ/NE 與
   GE/GT/LE/LT 對空值的不同判定邏輯。
@@ -161,6 +177,20 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
   `G90/G92/G94` 在此手冊中屬於「01組固定循環」而非銑床的絕對/增量模式；
   絕對/增量由位址決定（`X/Z` = 絕對，`U/W` = 增量），因此 ModalState 不需要
   絕對/增量旗標，改為在每個 NC 語句解析時依位址字母判斷。
+- **01組（motion group）G代碼本身是模態的**：`G00/G01/G02/G03/G32/G90/
+  G92/G94/G70~G76` 同屬一組，程式段沒有重新指定 G 代碼時，沿用上一個
+  01組 G 代碼繼續執行（例如 `G01 X10;` 之後接 `Z20;`，等同 `G01 Z20;`）。
+  這是比「固定循環參數黏著」（見第7節）更基礎、更常見的行為，兩者其實
+  是同一個模態機制的一部分：ModalState 只需要記住「目前生效的01組G
+  代碼」＋「該G代碼對應的模態參數（固定循環才有Z/W/R/F等）」，每個
+  block 解析時，若無新 G 代碼就沿用前者，若有則切換並清除固定循環參數。
+  **這一項必須在 Phase 0 就實作**（比 Phase 3/4 的固定循環模態黏著更早，
+  因為連最基本的 G01/G02/G03 省略重複也依賴它）。
+- **F/S（進給率/主軸轉速）不做模態追蹤，僅原樣記錄**：F/S 不影響路徑
+  幾何形狀，本專案目的是路徑模擬，因此 `Move.feed`/`Move.spindle` 只在
+  該 block 有指定時填入該值，沒指定就是 `None`，**不實作**「沿用上一個
+  F/S值」的模態邏輯（真機上F/S確實也是模態沿用，但既然不影響路徑、
+  也不做時間相關的動畫，追蹤它沒有實際用途，徒增複雜度）。
 - **G50 座標設定 / 主軸最高轉速限制**：`G50` 車床專用，同一 G 代碼依
   指定的位址分成兩種完全不同語意，需在 parser 層依位址判斷分派：
   - `G50 X_ Z_（IP_）`：不產生移動，而是把「目前刀具實際位置」登記為
@@ -207,8 +237,12 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
 | G71 | roughing.py | 外徑粗車，類型I（單調輪廓）/類型II（含槽孔），
                        需要一個「輪廓子解譯器」執行 ns~nf 區間取得精車輪廓，
                        再依 Δd 分層、Δu/Δw 偏移生成粗車路徑 |
-| G72 | roughing.py | 端面粗車，邏輯同 G71 但主軸方向互換 |
-| G73 | pattern_repeat.py | 閉環/仿形粗車，依分割次數 d 逐步逼近輪廓 |
+| G72 | roughing.py | 端面粗車，邏輯同 G71，但切削方向平行的軸互換
+                       （G71 平行平面第2軸/X軸，G72 平行平面第1軸/Z軸），
+                       與主軸旋轉方向（M03/M04）無關 |
+| G73 | pattern_repeat.py | 閉環/仿形粗車，把精車輪廓依分割次數 d 等距
+                       平移 d 次，逐層切削（是幾何上的平行複製，不是
+                       數值迭代收斂） |
 | G70 | finishing.py | 直接執行 ns~nf 精車輪廓（帶各段自己的 F/S/T） |
 | G74 | grooving.py | 端面切斷/深孔鑽（Δk 進刀、Δd 退刀的間歇循環） |
 | G75 | grooving.py | 外徑/內徑切斷、切槽（邏輯同G74，X/Z對調） |
@@ -223,8 +257,10 @@ VarRef 支援 `#i`、`#[expr]`、系統變量名稱 `[#_NAME[n]]`。
 G92 → G76 → G71類型II（槽孔）→ G74/G75。理由：G90/G94/G70/G71類型I
 幾何最單純且最常用，G76/類型II槽孔涉及最多分支條件，留到後面。
 
-**單一型固定循環（G90/G92/G94）為模態且會沿用上次數值**：依手冊4.1.6節，
-`X(U)/Z(W)/R` 三者共用同一組模態值，未重新指定時沿用前一次的值。也就是
+**單一型固定循環（G90/G92/G94）額外沿用上次的循環參數**：這是第6節
+「01組G代碼皆為模態」機制的延伸——不只 G 代碼本身模態，固定循環還會
+把 `X(U)/Z(W)/R` 這組參數一併記在目前生效的 G代碼狀態裡。依手冊4.1.6
+節，未重新指定時沿用前一次的值。也就是
 說後續程式段只給 `U-16.0;`（不重複 `G90`）也會**再觸發一次循環**，用新的
 U 值搭配舊的 Z/W/R/F。範例（手冊原文）：
 ```
@@ -244,16 +280,19 @@ N033 U-32.0;
 @dataclass
 class Move:
     kind: Literal["rapid", "linear", "arc", "thread"]
-    start: tuple[float, float]   # (Z, X) 依手冊慣例 X 為直徑值；刀尖中心座標
+    start: tuple[float, float]   # (Z, X) — X 內部一律存半徑值，與程式輸入
+        # 是直徑編程或半徑編程無關；直徑/半徑轉換只發生在 units.py 解析
+        # NC 語句當下（見第13節第10點），Move 存好之後意義固定、不再受
+        # 外部設定影響。
     end: tuple[float, float]
     programmed_end: tuple[float, float] | None = None  # 編程座標（未套用刀尖
-        # 半徑補償前的目標點）。Phase 0~4 恆等於 end；Phase 4.5 導入 G41/G42
-        # 後，end 改為刀尖中心實際座標，programmed_end 保留原始編程座標，
-        # 兩者都要能查得到（除錯、對照原始程式用）。
-    feed: float | None = None
-    spindle: float | None = None
-    feed_mode: Literal["per_min", "per_rev"] | None = None   # G98/G99，僅記錄
-    spindle_mode: Literal["rpm", "css"] | None = None         # G97/G96，僅記錄
+        # 半徑補償前的目標點，同樣一律是半徑值）。end 是刀尖中心實際座標
+        # （套用 G41/G42 補償後的結果，見 tool_comp.py 的介入方式）；未使用
+        # 補償或補償取消狀態下，programmed_end == end。兩者都要能查得到
+        # （除錯、對照原始程式用）。
+    feed: float | None = None    # 該 block 若有指定 F 才填入，否則 None；
+        # 不做模態沿用追蹤（見第6節，F/S 不影響路徑，只原樣記錄）
+    spindle: float | None = None  # 同上，該 block 若有指定 S 才填入
     arc_center: tuple[float, float] | None = None
     arc_ccw: bool | None = None
     source_line: int | None = None   # 對應原始程式行號，方便除錯
@@ -262,8 +301,11 @@ class Move:
 
 @dataclass
 class Toolpath:
-    moves: list[Move]
-    diameter_programming: bool = True  # X 為直徑值（手冊預設）
+    moves: list[Move]   # 座標一律是半徑值；顯示成直徑（車床慣例）只在
+        # viz_matplotlib.py / export_json.py 輸出當下轉換一次，供人看的
+        # 圖上以直徑呈現，不影響 Move 內部儲存的值
+    max_spindle_rpm: float | None = None  # G50 S_ 設定值，純記錄，不參與
+        # 路徑計算（見第6節 G50 說明）
 ```
 
 `ToolEntry`/`ToolTable` 定義在 `tool_table.py`（見第2節專案結構），非本檔：
@@ -296,13 +338,19 @@ class ToolTable(dict[str, ToolEntry]):
 
 ## 9. 視覺化
 
+**範圍已確認：只做完整路徑的靜態顯示，不做時間軸拖曳/動畫互動**——
+`Move` 沒有計算移動耗時，本來就不具備做「真正時間軸」的資料基礎，
+與其做一個只是「步驟序號軸」卻取名「時間軸」的容易誤導功能，不如
+先不做，之後真有需要時再評估。
+
 - `viz_matplotlib.py`：
-  - 靜態圖：rapid（虛線）vs 切削進給（實線）vs 螺紋（另一顏色），ZX 平面。
-  - 動畫：`FuncAnimation` 逐步顯示刀具目前位置。
+  - 靜態圖：rapid（虛線）vs 切削進給（實線）vs 螺紋（另一顏色），ZX 平面，
+    一次畫出完整刀具路徑。
 - `export_json.py` + `web_viewer/`：
   - 匯出 `{moves: [...], meta: {...}}`
-  - 網頁用 Canvas 畫出路徑，可拖曳時間軸單步檢視、hover 顯示對應原始
-    程式行號（呼應 `source_line` 欄位，方便對照除錯）。
+  - 網頁用 Canvas 畫出**完整路徑**（同樣 rapid/切削/螺紋以樣式區分），
+    hover 顯示對應原始程式行號（呼應 `source_line` 欄位，方便對照除錯）；
+    不做拖曳時間軸、不做逐步動畫。
 
 ## 10. 測試策略
 
@@ -341,7 +389,8 @@ class ToolTable(dict[str, ToolEntry]):
   G73→G76→G74/G75）。G76 的 `P(m)(r)(a)` 位數編碼解析需獨立單元測試。
 - **Phase 4.5** 刀尖半徑補償（G41/G42）整合進固定循環與一般插補路徑，
   含循環起點偏置取消/重新起刀的時機處理（見第13節第4點）。
-- **Phase 5** 網頁互動 viewer（JSON匯出 + Canvas）、動畫。
+- **Phase 5** 網頁 viewer（JSON匯出 + Canvas 顯示完整路徑，無動畫/時間軸，
+  見第9節）。
 - **Phase 6**（stretch）庫存材料切削模擬（stock removal，多邊形布林運算
   視覺化材料被切除的過程）。
 
@@ -395,14 +444,24 @@ class ToolTable(dict[str, ToolEntry]):
    刀尖半徑/假想刀尖方向，先允許全部留白/預設0），避免 Phase 4.5 時
    又要回頭改資料結構。
 
-4. **刀尖半徑補償提前後，資料結構要預留「程式路徑」與「補償後路徑」
-   分離存放**。手冊 4.1.5、4.2.1 節說明固定循環搭配 G41/G42 時，偏置
-   在循環起點會暫時取消、在下一個移動指令才重新起刀，且刀尖中心路徑
-   與編程路徑不同（見刀尖半徑中心路徑圖）。若 `Move`/`Toolpath` 一開始
-   沒有把「編程座標」與「刀尖中心座標」分開存，Phase 4.5 要疊加補償時
-   會被迫大改第7、8節已完成的固定循環模組。因此第8節的 `Move` dataclass
-   建議從 Phase 0 就加上 `programmed_end: tuple | None` 欄位（先恆等於
-   `end`），Phase 4.5 再讓補償計算填入真正偏移後的 `end`。
+4. **刀尖半徑補償要在生成當下就介入，不是事後對 Move 列表後製**（已確認）。
+   手冊 4.1.5、4.2.1 節說明固定循環搭配 G41/G42 時，偏置在循環起點會
+   暫時取消、在下一個移動指令才重新起刀，這個時機資訊只有在
+   `motion.py`/`canned_cycles/*` 生成移動的當下才知道（例如「現在正在
+   產生循環起點回程的那一段」），事後只看一串 `Move` 列表無法可靠地
+   反推。因此架構定為：`motion.py`、`canned_cycles/*` 在計算每個移動的
+   終點時，直接呼叫 `tool_comp.py` 提供的介面（例如
+   `tool_comp.offset(programmed_point, comp_state) -> actual_point`）取得
+   實際刀尖中心座標，`comp_state`（目前是G40/G41/G42、刀尖半徑、假想
+   方向）由 interpreter 的 ModalState 維護並傳入。`simulator.py` 不再是
+   「跑完 canned_cycles 才把整串路徑丟給 tool_comp 修正」的線性管線。
+   Phase 0~4（`tool_comp.py` 真正的補償算法還沒寫之前）該介面先做成
+   `offset(p, comp_state) = p`（恆等函式，comp_state 恆為 G40），Phase 4.5
+   才把真正的偏移幾何算法填進去——**呼叫點與資料流從 Phase 0 就固定**，
+   Phase 4.5 只是把介面內部的空實作換成真正算法，不需要回頭修改
+   `motion.py`/`canned_cycles/*` 的呼叫方式。`Move.programmed_end` 欄位
+   保留（見第8節），存的是呼叫 `tool_comp.offset()` 之前的原始編程座標，
+   `Move.end` 存呼叫之後的實際座標，Phase 0~4 兩者相等。
 
 5. **明確排除的行為（非路徑幾何，屬即時操作員介入）**：單程序段停止、
    進給暫停（feed hold）、螺紋切削循環收回功能（4.1.2節「帶有螺紋切削
@@ -418,12 +477,20 @@ class ToolTable(dict[str, ToolEntry]):
    `parser.py`／`threading.py` 加專門的單元測試覆蓋（含 `m,r,a` 用參數
    預設值省略指定的情形）。
 
-7. **記錄但不影響路徑幾何的模態資訊**：`G96/G97`（恆線速度/恆轉速）、
-   `G98/G99`（每分鐘進給/每轉進給）、`G20/G21`（英制/公制）。這些會
-   影響動畫播放的時間感、單位換算，但不改變刀具路徑的幾何形狀。
-   規劃上把它們存成 `Move` 或 `Toolpath` 的中繼資料（`feed_mode`、
-   `spindle_mode`、`unit`），供視覺化/動畫使用，但不參與路徑計算，
-   並在文件中明講「有記錄、不影響幾何」，避免被誤以為完全忽略。
+7. **`G96/G97/G98/G99` 與 `G20/G21` 要分開處理，兩者性質不同**（已依
+   「不做動畫/時間軸」的決議調整）：
+   - `G96/G97`（恆線速度/恆轉速）、`G98/G99`（每分鐘進給/每轉進給）：
+     原本規劃是為了動畫播放的時間感而記錄，但範圍已確認不做動畫/時間軸
+     （見第9節），這幾個 G 代碼**目前沒有任何消費者**，v1 只需要
+     lexer/parser 能正確辨識、解析成功、不報錯即可，**不需要**在 `Move`
+     上加對應欄位（先前規劃的 `feed_mode`/`spindle_mode` 欄位已從第8節
+     `Move` dataclass移除）。若之後真的要做進給/轉速相關的分析或動畫，
+     屆時再评估要不要加回資料結構。
+   - `G20/G21`（英制/公制）：這個**會**影響路徑幾何——同一個數值
+     `X10.0` 在英制與公制下代表的實際距離不同，屬於數值換算層級的
+     問題，不是單純的中繼資料。規劃在 `units.py` 提供公制/英制轉換
+     （內部一律換算成統一單位，如公制 mm），在 lexer/parser 解析數值
+     當下依目前生效的 `G20/G21` 狀態換算，而非留給下游模組各自處理。
 
 8. **可選程序段跳過 `/`（block skip）先做成可關閉的設定**，預設不跳過
    （即完整模擬全部程式），因為手冊提到 `/n`（n=1~9）不可作為變量使用，
@@ -442,7 +509,10 @@ class ToolTable(dict[str, ToolEntry]):
     卻沒有測試抓到。規劃在 `gcode_sim/units.py` 提供
     `to_radius(value, is_diameter_axis)` / 正負號規則常數表，各循環模組
     只呼叫共用函式，並在 `test_units.py` 針對每個循環的參數表各寫一條
-    對照表測試。
+    對照表測試。轉換只在解析 NC 語句、產生 `Move` 的當下發生一次（一律
+    轉成半徑值存進 `Move`，見第8節），下游（`canned_cycles/*`、
+    `tool_comp.py`、視覺化）都以半徑值運算，只有輸出顯示時才視需要轉回
+    直徑值，避免同一個座標值的意義隨著某個外部旗標而改變。
 
 11. **固定循環模態未重新指定即沿用上次數值**（見第6、7節新增段落）。
     這是容易被忽略、但屬於「正確性」而非「錦上添花」的行為：G90/G92/G94
