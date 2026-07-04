@@ -33,7 +33,7 @@ rather than being silently ignored or misinterpreted.
 from dataclasses import dataclass
 
 from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
-from .canned_cycles import contour, roughing
+from .canned_cycles import contour, pattern_repeat, roughing
 from .canned_cycles import threading as thread_cycles
 from .canned_cycles import turning
 from .errors import MacroError, ParseError, UnsupportedFeatureError
@@ -72,15 +72,15 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 UNSUPPORTED_G = {
     28.0, 30.0,  # reference point return
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
-    73.0, 74.0, 75.0, 76.0,  # compound canned cycles not yet implemented
+    74.0, 75.0, 76.0,  # compound canned cycles not yet implemented
 }
 
-# G70/G71/G72 are one-shot compound-cycle actions, handled directly in
+# G70/G71/G72/G73 are one-shot compound-cycle actions, handled directly in
 # _execute like G50 -- they don't persist as the modal motion_g (unlike
 # G90/G92/G94's re-triggering behavior), since a single G71/G70
 # invocation is a complete action, not a state that later bare blocks
 # should replay.
-ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0}
+ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0}
 
 END_PROGRAM_M = {2.0, 30.0}
 
@@ -130,6 +130,12 @@ class ModalState:
     # between G71/G72 -- see roughing.py module docstring.
     g7x_depth: float | None = None
     g7x_retract: float = 0.0
+    # Δi/Δk/d for G73 (manual: modal, set by a "G73 U_ W_ R_;" block with
+    # no P/Q -- note G73's R is a division *count*, unlike G71/G72's R
+    # which is a 45-degree retreat distance; see pattern_repeat.py).
+    g73_i: float | None = None
+    g73_k: float = 0.0
+    g73_count: int | None = None
 
 
 class Interpreter:
@@ -440,6 +446,9 @@ class Interpreter:
         if one_shot == 72.0:
             self._apply_g72(stmt, by_addr)
             return
+        if one_shot == 73.0:
+            self._apply_g73(stmt, by_addr)
+            return
 
         self._dispatch_motion(stmt, by_addr)
 
@@ -508,6 +517,44 @@ class Interpreter:
             self.state.g7x_retract = to_internal_length(
                 "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
             )
+
+    def _apply_g73(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            if "Q" not in by_addr:
+                raise ParseError(f"line {stmt.line_no}: G73 P.. requires Q..")
+            if self.state.g73_count is None:
+                raise ParseError(
+                    f"line {stmt.line_no}: G73 needs Δi/Δk/d set first by a 'G73 U_ W_ R_;' block (no P/Q)"
+                )
+            ns = int(by_addr["P"][0].value)
+            nf = int(by_addr["Q"][0].value)
+            du = to_internal_length("U", by_addr["U"][0].value, unit_scale=self.state.unit_scale) if "U" in by_addr else 0.0
+            dw = to_internal_length("W", by_addr["W"][0].value, unit_scale=self.state.unit_scale) if "W" in by_addr else 0.0
+            feed = by_addr["F"][0].value if "F" in by_addr else None
+            shape = self._trace_shape(ns, nf)
+            moves = pattern_repeat.expand_g73(
+                self.state.pos, shape, self.state.g73_i, self.state.g73_k, self.state.g73_count, du, dw, feed, stmt.line_no
+            )
+            self._append_cycle_moves(moves)
+        else:
+            self._set_g73_params(stmt, by_addr)
+
+    def _set_g73_params(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        # Δi (X)/Δk (Z) are always radius-mode regardless of diameter
+        # programming, like G71/G72's Δd -- see _set_g7x_params. G73's R
+        # is a plain division *count* (an integer, not a length), unlike
+        # G71/G72's R (a 45-degree retreat distance) -- so it's parsed as
+        # a raw number, not passed through to_internal_length.
+        if "U" in by_addr:
+            self.state.g73_i = to_internal_length(
+                "U", by_addr["U"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+        if "W" in by_addr:
+            self.state.g73_k = to_internal_length(
+                "W", by_addr["W"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+        if "R" in by_addr:
+            self.state.g73_count = int(by_addr["R"][0].value)
 
     def _append_cycle_moves(self, moves: list[Move]) -> None:
         for m in moves:

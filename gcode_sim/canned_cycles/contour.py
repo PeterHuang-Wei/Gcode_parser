@@ -38,6 +38,30 @@ def find_range(statements: list, ns: int, nf: int) -> list:
     return statements[ns_idx : nf_idx + 1]
 
 
+def offset_point(p: Point, dz: float, dx: float) -> Point:
+    return (p[0] + dz, p[1] + dx)
+
+
+def offset_moves(shape_moves: list[Move], dz: float, dx: float, feed: float | None, cycle_name: str) -> list[Move]:
+    """Offsets an entire traced Move list by a fixed (dz, dx) amount,
+    preserving each move's own kind (a rapid opening move stays rapid).
+    Shared by G71/G72's final rough-finish contour pass and G73's
+    parallel-shifted repeat passes -- both retrace the *whole* shape
+    program, just offset by a different amount each time."""
+    moves: list[Move] = []
+    for m in shape_moves:
+        start = offset_point(m.start, dz, dx)
+        end = offset_point(m.end, dz, dx)
+        if start == end:
+            continue
+        new_m = Move(kind=m.kind, start=start, end=end, feed=feed, source_line=m.source_line, cycle=cycle_name)
+        if m.kind == "arc" and m.arc_center is not None:
+            new_m.arc_center = offset_point(m.arc_center, dz, dx)
+            new_m.arc_ccw = m.arc_ccw
+        moves.append(new_m)
+    return moves
+
+
 def sample_points(moves: list[Move], points_per_arc: int = 50) -> list[Point]:
     """Flattens a traced Move list into a single polyline. Used only for
     the rough-pass boundary intersection math in roughing.py/

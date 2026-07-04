@@ -40,25 +40,6 @@ from ..toolpath import Move, Point
 from . import contour as contour_mod
 
 
-def _offset_point(p: Point, dz: float, dx: float) -> Point:
-    return (p[0] + dz, p[1] + dx)
-
-
-def _final_contour_pass(shape_moves: list[Move], dz: float, dx: float, feed: float | None, cycle_name: str) -> list[Move]:
-    moves = []
-    for m in shape_moves:
-        start = _offset_point(m.start, dz, dx)
-        end = _offset_point(m.end, dz, dx)
-        if start == end:
-            continue
-        new_m = Move(kind=m.kind, start=start, end=end, feed=feed, source_line=m.source_line, cycle=cycle_name)
-        if m.kind == "arc" and m.arc_center is not None:
-            new_m.arc_center = _offset_point(m.arc_center, dz, dx)
-            new_m.arc_ccw = m.arc_ccw
-        moves.append(new_m)
-    return moves
-
-
 def _connect_to_final_pass(
     pos: Point,
     shape_moves: list[Move],
@@ -76,10 +57,10 @@ def _connect_to_final_pass(
     the last stepped pass's end and the final pass's start were two
     disconnected points -- an unphysical jump caught by inspecting the
     printed Move list before trusting it, see this module's docstring)."""
-    final_pass = _final_contour_pass(shape_moves, dz, dx, feed, cycle_name)
+    final_pass = contour_mod.offset_moves(shape_moves, dz, dx, feed, cycle_name)
     if not final_pass:
         return final_pass
-    contour_start = _offset_point(shape_moves[0].start, dz, dx)
+    contour_start = contour_mod.offset_point(shape_moves[0].start, dz, dx)
     if pos == contour_start:
         return final_pass
     connector = Move(kind="rapid", start=pos, end=contour_start, source_line=source_line, cycle=cycle_name)
@@ -115,7 +96,7 @@ def expand_g71(
     # lookup: it isn't part of the finished shape, so an X level that
     # falls between S and A' must clamp to A's own depth, not interpolate
     # through a segment that was never a cut (see contour.z_at_x).
-    offset_points = [_offset_point(p, dw, du) for p in points[1:]]
+    offset_points = [contour_mod.offset_point(p, dw, du) for p in points[1:]]
     target_x = points[-1][1] + du
 
     moves: list[Move] = []
@@ -160,7 +141,7 @@ def expand_g72(
     direction = 1.0 if a_prime_z > sz else -1.0
     step = depth * direction
 
-    offset_points = [_offset_point(p, dw, du) for p in points[1:]]  # see expand_g71's comment
+    offset_points = [contour_mod.offset_point(p, dw, du) for p in points[1:]]  # see expand_g71's comment
     target_z = points[-1][0] + dw
 
     moves: list[Move] = []

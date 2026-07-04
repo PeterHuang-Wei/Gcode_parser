@@ -100,11 +100,11 @@ def test_g50_s_sets_max_spindle_rpm_without_creating_a_move():
 
 
 def test_unsupported_canned_cycle_raises_clear_error():
-    # G71/G72 are implemented (Phase 4); G73 is not yet.
+    # G71/G72/G73 are implemented (Phase 4); G74/G75/G76 are not yet.
     with pytest.raises(UnsupportedFeatureError):
         simulator.run(
             """
-            G73 U1.0 W0.5 R3;
+            G74 R1.0;
             M30;
             """
         )

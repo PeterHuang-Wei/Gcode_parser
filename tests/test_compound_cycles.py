@@ -1,16 +1,16 @@
-"""Phase 4: compound canned cycles G70/G71/G72 (manual 4.2, docs/PLAN.md
-section 7 / 13.12). Expected coordinates below were derived by hand from
-the shape geometry *before* running the code -- see roughing.py's module
-docstring and contour.py's z_at_x/x_at_z docstrings for the two bugs this
-hand-tracing actually caught (opening-move leaking into the intersection
-lookup, and out-of-range levels clamping to the nearest point instead of
-the contour's own last/deepest point).
+"""Phase 4: compound canned cycles G70/G71/G72/G73 (manual 4.2,
+docs/PLAN.md section 7 / 13.12). Expected coordinates below were derived
+by hand from the shape geometry *before* running the code -- see
+roughing.py's module docstring and contour.py's z_at_x/x_at_z docstrings
+for the two bugs this hand-tracing actually caught (opening-move leaking
+into the intersection lookup, and out-of-range levels clamping to the
+nearest point instead of the contour's own last/deepest point).
 
-Both worked examples below use a shape program with a *constant* step-axis
-level (a plain cylindrical turn for G71, a plain flat face for G72), which
-is deliberately the simplest case where every out-of-range rough pass must
-cut the *entire* remaining depth in one go -- exactly the behavior that
-was wrong before the fix.
+Both G71/G72 worked examples below use a shape program with a *constant*
+step-axis level (a plain cylindrical turn for G71, a plain flat face for
+G72), which is deliberately the simplest case where every out-of-range
+rough pass must cut the *entire* remaining depth in one go -- exactly the
+behavior that was wrong before the fix.
 """
 
 import math
@@ -178,6 +178,74 @@ def test_g71_requires_depth_set_before_p_q_block():
             G50 X44.0 Z2.0;
             G71 P10 Q20 U1.0 W0.5 F0.2;
             N10 G00 X20.0;
+            N20 G01 Z-30.0 F0.15;
+            M30;
+            """
+        )
+
+
+def test_g73_repeats_the_whole_contour_with_decreasing_parallel_offsets():
+    # S=(z=2,x=22). Shape: N10 G00 X10.0 (diameter -> A'=(2,5), radius),
+    # N20 G01 Z-30.0 (-> B=(-30,5)). Delta i=4.0 (radius, X total
+    # retreat), Delta k=2.0 (Z total retreat), d=3 divisions. Delta
+    # u=1.0 diameter (=0.5 radius), Delta w=0.5.
+    #
+    # Pass n's offset is (dw + k*(d-n)/d, du + i*(d-n)/d):
+    #   n=1: frac=2/3 -> offset=(0.5+2*2/3, 0.5+4*2/3)=(1.8333..., 3.1666...)
+    #   n=2: frac=1/3 -> offset=(0.5+2/3,   0.5+4/3)  =(1.1666..., 1.8333...)
+    #   n=3: frac=0   -> offset=(0.5, 0.5)  -- just the finishing allowance
+    # Each pass is the *entire* shape (both moves) shifted by that amount.
+    toolpath = simulator.run(
+        """
+        G50 X44.0 Z2.0;
+        G73 U4.0 W2.0 R3;
+        G73 P10 Q20 U1.0 W0.5 F0.2;
+        N10 G00 X10.0;
+        N20 G01 Z-30.0 F0.15;
+        M30;
+        """
+    )
+    moves = [m for m in toolpath.moves if m.cycle == "G73"]
+    assert len(moves) == 3 * 3  # 3 passes x (connector rapid + 2 shifted shape legs)
+
+    expected_offsets = [
+        (0.5 + 2.0 * 2 / 3, 0.5 + 4.0 * 2 / 3),
+        (0.5 + 2.0 * 1 / 3, 0.5 + 4.0 * 1 / 3),
+        (0.5, 0.5),
+    ]
+    for i, (dz, dx) in enumerate(expected_offsets):
+        connector, leg1, leg2 = moves[3 * i : 3 * i + 3]
+        assert connector.kind == "rapid"
+        assert connector.end == pytest.approx((2.0 + dz, 22.0 + dx))
+        assert leg1.kind == "rapid"  # shape's own opening move (N10 G00) stays rapid
+        assert leg1.start == pytest.approx((2.0 + dz, 22.0 + dx))
+        assert leg1.end == pytest.approx((2.0 + dz, 5.0 + dx))
+        assert leg2.kind == "linear"
+        assert leg2.start == pytest.approx((2.0 + dz, 5.0 + dx))
+        assert leg2.end == pytest.approx((-30.0 + dz, 5.0 + dx))
+
+
+def test_g73_requires_params_set_before_p_q_block():
+    with pytest.raises(ParseError):
+        simulator.run(
+            """
+            G50 X44.0 Z2.0;
+            G73 P10 Q20 U1.0 W0.5 F0.2;
+            N10 G00 X10.0;
+            N20 G01 Z-30.0 F0.15;
+            M30;
+            """
+        )
+
+
+def test_g73_division_count_must_be_positive():
+    with pytest.raises(CannedCycleError):
+        simulator.run(
+            """
+            G50 X44.0 Z2.0;
+            G73 U4.0 W2.0 R0;
+            G73 P10 Q20 U1.0 W0.5 F0.2;
+            N10 G00 X10.0;
             N20 G01 Z-30.0 F0.15;
             M30;
             """
