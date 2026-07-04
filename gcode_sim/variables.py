@@ -84,6 +84,21 @@ class VariableStore:
         self.locals = VariableStack()
         self._position_provider = None
 
+    def snapshot(self) -> tuple[dict[int, Value], dict[int, Value]]:
+        """Captures common variables and the *current* local frame, for
+        canned-cycle contour tracing (docs/PLAN.md section 13.12): G71/
+        G72/G73 sample the shape program once to get its geometry, then
+        G70 (or the cycle itself) may run it again for real -- side
+        effects from the sampling pass must not double-count."""
+        return dict(self._common), dict(self.locals._frames[-1])
+
+    def restore(self, snapshot: tuple[dict[int, Value], dict[int, Value]]) -> None:
+        common, local_frame = snapshot
+        self._common.clear()
+        self._common.update(common)
+        self.locals._frames[-1].clear()
+        self.locals._frames[-1].update(local_frame)
+
     def bind_position_provider(self, provider) -> None:
         """``provider`` is a zero-arg callable returning the current
         (z, x) tool position (radius units), used to answer #5001/#5002

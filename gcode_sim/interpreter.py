@@ -33,6 +33,7 @@ rather than being silently ignored or misinterpreted.
 from dataclasses import dataclass
 
 from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
+from .canned_cycles import contour, roughing
 from .canned_cycles import threading as thread_cycles
 from .canned_cycles import turning
 from .errors import MacroError, ParseError, UnsupportedFeatureError
@@ -71,8 +72,15 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 UNSUPPORTED_G = {
     28.0, 30.0,  # reference point return
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
-    70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0,  # compound canned cycles
+    73.0, 74.0, 75.0, 76.0,  # compound canned cycles not yet implemented
 }
+
+# G70/G71/G72 are one-shot compound-cycle actions, handled directly in
+# _execute like G50 -- they don't persist as the modal motion_g (unlike
+# G90/G92/G94's re-triggering behavior), since a single G71/G70
+# invocation is a complete action, not a state that later bare blocks
+# should replay.
+ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0}
 
 END_PROGRAM_M = {2.0, 30.0}
 
@@ -117,6 +125,11 @@ class ModalState:
     cycle_z: float | None = None
     cycle_r: float = 0.0
     cycle_f: float | None = None
+    # Δd/e for G71/G72 (manual: modal, set by a "G71 U_ R_;" block with
+    # no P/Q, consumed by a later "G71 P_ Q_ ...;" trigger block). Shared
+    # between G71/G72 -- see roughing.py module docstring.
+    g7x_depth: float | None = None
+    g7x_retract: float = 0.0
 
 
 class Interpreter:
@@ -130,6 +143,7 @@ class Interpreter:
         self._subprogram_depth = 0
         self._macro_depth = 0
         self._call_depth = 0
+        self._program_stack: list[list] = []
 
     def run(self, statements: list, registry=None) -> Toolpath:
         self.registry = registry
@@ -143,18 +157,22 @@ class Interpreter:
     # ------------------------------------------------- program-level loop
 
     def _execute_program(self, statements: list) -> None:
-        seq_index, do_to_end, end_to_do = _build_indices(statements)
-        ip = 0
-        n = len(statements)
-        while ip < n:
-            stmt = statements[ip]
-            outcome = self._execute_one(stmt, ip, seq_index, do_to_end, end_to_do)
-            if outcome is None:
-                ip += 1
-            elif outcome == "RETURN":
-                return
-            else:
-                ip = outcome  # absolute jump target
+        self._program_stack.append(statements)
+        try:
+            seq_index, do_to_end, end_to_do = _build_indices(statements)
+            ip = 0
+            n = len(statements)
+            while ip < n:
+                stmt = statements[ip]
+                outcome = self._execute_one(stmt, ip, seq_index, do_to_end, end_to_do)
+                if outcome is None:
+                    ip += 1
+                elif outcome == "RETURN":
+                    return
+                else:
+                    ip = outcome  # absolute jump target
+        finally:
+            self._program_stack.pop()
 
     def _execute_one(self, stmt, index: int, seq_index, do_to_end, end_to_do):
         if isinstance(stmt, NCStatement):
@@ -331,6 +349,43 @@ class Interpreter:
             self._macro_depth -= 1
             self._call_depth -= 1
 
+    # ---------------------------------------- compound-cycle shape programs
+
+    def _current_program_statements(self) -> list:
+        if not self._program_stack:
+            raise MacroError("no active program to search for a G70/G71/G72/G73 sequence range")
+        return self._program_stack[-1]
+
+    def _trace_shape(self, ns: int, nf: int) -> list[Move]:
+        """Runs the ns..nf sub-range starting at the current position,
+        returning the resulting Move list, then undoes all side effects
+        (position, modal G-code, and macro variables) as if it never
+        ran -- used by G71/G72/G73 to sample the finishing contour
+        without the sampling pass itself counting as a real cut, and
+        without double-counting any macro variable side effects when
+        G70 (or the cycle) later runs the same range for real."""
+        sub_range = contour.find_range(self._current_program_statements(), ns, nf)
+        saved_pos = self.state.pos
+        saved_motion_g = self.state.motion_g
+        saved_vars = self.variables.snapshot()
+        saved_toolpath = self.toolpath
+        self.toolpath = Toolpath()
+        try:
+            self._execute_program(sub_range)
+            return list(self.toolpath.moves)
+        finally:
+            self.toolpath = saved_toolpath
+            self.state.pos = saved_pos
+            self.state.motion_g = saved_motion_g
+            self.variables.restore(saved_vars)
+
+    def _execute_shape(self, ns: int, nf: int) -> None:
+        """Runs the ns..nf sub-range for real (G70): Move objects are
+        appended to the real toolpath and position/variable side effects
+        are committed, using each block's own F/S/T."""
+        sub_range = contour.find_range(self._current_program_statements(), ns, nf)
+        self._execute_program(sub_range)
+
     # ------------------------------------------------------ NC statements
 
     def _resolve_word_raw(self, w: Word):
@@ -364,7 +419,8 @@ class Interpreter:
 
         g_words = by_addr.get("G", [])
         is_g50 = any(rw.value == 50.0 for rw in g_words)
-        motion_group_words = [rw for rw in g_words if rw.value != 50.0]
+        one_shot = next((rw.value for rw in g_words if rw.value in ONE_SHOT_CYCLE_G), None)
+        motion_group_words = [rw for rw in g_words if rw.value != 50.0 and rw.value not in ONE_SHOT_CYCLE_G]
         self._apply_g_codes(motion_group_words)
 
         if "T" in by_addr:
@@ -375,7 +431,90 @@ class Interpreter:
             self._apply_g50(by_addr)
             return  # X/Z in a G50 block declare a coordinate, they don't move the tool
 
+        if one_shot == 70.0:
+            self._apply_g70(stmt, by_addr)
+            return
+        if one_shot == 71.0:
+            self._apply_g71(stmt, by_addr)
+            return
+        if one_shot == 72.0:
+            self._apply_g72(stmt, by_addr)
+            return
+
         self._dispatch_motion(stmt, by_addr)
+
+    def _apply_g70(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" not in by_addr or "Q" not in by_addr:
+            raise ParseError(f"line {stmt.line_no}: G70 requires both P and Q")
+        ns = int(by_addr["P"][0].value)
+        nf = int(by_addr["Q"][0].value)
+        self._execute_shape(ns, nf)
+
+    def _apply_g71(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            if "Q" not in by_addr:
+                raise ParseError(f"line {stmt.line_no}: G71 P.. requires Q..")
+            if self.state.g7x_depth is None:
+                raise ParseError(
+                    f"line {stmt.line_no}: G71 needs Δd set first by a 'G71 U_ R_;' block (no P/Q)"
+                )
+            ns = int(by_addr["P"][0].value)
+            nf = int(by_addr["Q"][0].value)
+            du = to_internal_length("U", by_addr["U"][0].value, unit_scale=self.state.unit_scale) if "U" in by_addr else 0.0
+            dw = to_internal_length("W", by_addr["W"][0].value, unit_scale=self.state.unit_scale) if "W" in by_addr else 0.0
+            feed = by_addr["F"][0].value if "F" in by_addr else None
+            shape = self._trace_shape(ns, nf)
+            moves = roughing.expand_g71(
+                self.state.pos, shape, self.state.g7x_depth, self.state.g7x_retract, du, dw, feed, stmt.line_no
+            )
+            self._append_cycle_moves(moves)
+        else:
+            self._set_g7x_params(stmt, by_addr, "U")
+
+    def _apply_g72(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            if "Q" not in by_addr:
+                raise ParseError(f"line {stmt.line_no}: G72 P.. requires Q..")
+            if self.state.g7x_depth is None:
+                raise ParseError(
+                    f"line {stmt.line_no}: G72 needs Δd set first by a 'G72 W_ R_;' block (no P/Q)"
+                )
+            ns = int(by_addr["P"][0].value)
+            nf = int(by_addr["Q"][0].value)
+            du = to_internal_length("U", by_addr["U"][0].value, unit_scale=self.state.unit_scale) if "U" in by_addr else 0.0
+            dw = to_internal_length("W", by_addr["W"][0].value, unit_scale=self.state.unit_scale) if "W" in by_addr else 0.0
+            feed = by_addr["F"][0].value if "F" in by_addr else None
+            shape = self._trace_shape(ns, nf)
+            moves = roughing.expand_g72(
+                self.state.pos, shape, self.state.g7x_depth, self.state.g7x_retract, du, dw, feed, stmt.line_no
+            )
+            self._append_cycle_moves(moves)
+        else:
+            self._set_g7x_params(stmt, by_addr, "W")
+
+    def _set_g7x_params(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]], depth_addr: str) -> None:
+        # Δd/e are always radius-mode regardless of diameter programming
+        # (manual's parameter table), unlike Δu which is diametric --
+        # hence diameter_programming=False here specifically. depth_addr
+        # is "U" for G71 (steps parallel to X) and "W" for G72 (steps
+        # parallel to Z) -- the manual's G71/G72 opening-block formats
+        # mirror each other on this address, matching each cycle's own
+        # step axis.
+        if depth_addr in by_addr:
+            self.state.g7x_depth = to_internal_length(
+                depth_addr, by_addr[depth_addr][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+        if "R" in by_addr:
+            self.state.g7x_retract = to_internal_length(
+                "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+
+    def _append_cycle_moves(self, moves: list[Move]) -> None:
+        for m in moves:
+            m.tool = self.state.tool
+            self.toolpath.append(m)
+        if moves:
+            self.state.pos = moves[-1].end
 
     def _apply_g_codes(self, g_words: list[ResolvedWord]) -> None:
         for rw in g_words:
