@@ -33,7 +33,7 @@ rather than being silently ignored or misinterpreted.
 from dataclasses import dataclass
 
 from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
-from .canned_cycles import contour, pattern_repeat, roughing
+from .canned_cycles import contour, grooving, pattern_repeat, roughing
 from .canned_cycles import threading as thread_cycles
 from .canned_cycles import turning
 from .errors import MacroError, ParseError, UnsupportedFeatureError
@@ -72,15 +72,17 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 UNSUPPORTED_G = {
     28.0, 30.0,  # reference point return
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
-    74.0, 75.0, 76.0,  # compound canned cycles not yet implemented
+    76.0,  # compound canned cycle not yet implemented
 }
 
-# G70/G71/G72/G73 are one-shot compound-cycle actions, handled directly in
-# _execute like G50 -- they don't persist as the modal motion_g (unlike
-# G90/G92/G94's re-triggering behavior), since a single G71/G70
+# G70/G71/G72/G73/G74/G75 are one-shot compound-cycle actions, handled
+# directly in _execute like G50 -- they don't persist as the modal
+# motion_g (unlike G90/G92/G94's re-triggering behavior), since a single
 # invocation is a complete action, not a state that later bare blocks
-# should replay.
-ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0}
+# should replay. (G74/G75 aren't documented one way or the other in the
+# excerpts read; treated as one-shot here too, matching G70-G73, as the
+# more conservative choice -- flagged in grooving.py's module docstring.)
+ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0, 74.0, 75.0}
 
 END_PROGRAM_M = {2.0, 30.0}
 
@@ -136,6 +138,12 @@ class ModalState:
     g73_i: float | None = None
     g73_k: float = 0.0
     g73_count: int | None = None
+    # e (retract/relief amount) for G74/G75, set by a "G74 R_;" / "G75
+    # R_;" block with no X/Z/P/Q -- kept separate per cycle (unlike
+    # G71/G72's shared g7x_depth) since they're not typically interleaved
+    # in the same program section.
+    g74_e: float = 0.0
+    g75_e: float = 0.0
 
 
 class Interpreter:
@@ -449,6 +457,12 @@ class Interpreter:
         if one_shot == 73.0:
             self._apply_g73(stmt, by_addr)
             return
+        if one_shot == 74.0:
+            self._apply_g74(stmt, by_addr)
+            return
+        if one_shot == 75.0:
+            self._apply_g75(stmt, by_addr)
+            return
 
         self._dispatch_motion(stmt, by_addr)
 
@@ -555,6 +569,48 @@ class Interpreter:
             )
         if "R" in by_addr:
             self.state.g73_count = int(by_addr["R"][0].value)
+
+    def _apply_g74(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            if "Q" not in by_addr:
+                raise ParseError(f"line {stmt.line_no}: G74 P.. requires Q..")
+            target = self._resolve_end_point(stmt, by_addr, self.state.pos)
+            shift_x = to_internal_length(
+                "P", by_addr["P"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+            peck_z = to_internal_length(
+                "Q", by_addr["Q"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+            feed = by_addr["F"][0].value if "F" in by_addr else None
+            moves = grooving.expand_g74(
+                self.state.pos, target, shift_x, peck_z, self.state.g74_e, feed, stmt.line_no
+            )
+            self._append_cycle_moves(moves)
+        elif "R" in by_addr:
+            self.state.g74_e = to_internal_length(
+                "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+
+    def _apply_g75(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            if "Q" not in by_addr:
+                raise ParseError(f"line {stmt.line_no}: G75 P.. requires Q..")
+            target = self._resolve_end_point(stmt, by_addr, self.state.pos)
+            peck_x = to_internal_length(
+                "P", by_addr["P"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+            shift_z = to_internal_length(
+                "Q", by_addr["Q"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+            feed = by_addr["F"][0].value if "F" in by_addr else None
+            moves = grooving.expand_g75(
+                self.state.pos, target, peck_x, shift_z, self.state.g75_e, feed, stmt.line_no
+            )
+            self._append_cycle_moves(moves)
+        elif "R" in by_addr:
+            self.state.g75_e = to_internal_length(
+                "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
 
     def _append_cycle_moves(self, moves: list[Move]) -> None:
         for m in moves:
