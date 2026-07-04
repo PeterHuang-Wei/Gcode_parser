@@ -99,12 +99,13 @@ def test_g50_s_sets_max_spindle_rpm_without_creating_a_move():
     assert toolpath.max_spindle_rpm == pytest.approx(1500.0)
 
 
-def test_unsupported_canned_cycle_raises_clear_error():
-    # G71/G72/G73/G74/G75 are implemented (Phase 4); G76 is not yet.
+def test_unsupported_g_code_raises_clear_error():
+    # G70-G76 are all implemented (Phase 4); work coordinate systems
+    # (G54-G59) and reference point return (G28/G30) are not.
     with pytest.raises(UnsupportedFeatureError):
         simulator.run(
             """
-            G76 P021260 Q100 R100;
+            G54;
             M30;
             """
         )

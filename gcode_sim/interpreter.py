@@ -72,17 +72,16 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 UNSUPPORTED_G = {
     28.0, 30.0,  # reference point return
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
-    76.0,  # compound canned cycle not yet implemented
 }
 
-# G70/G71/G72/G73/G74/G75 are one-shot compound-cycle actions, handled
-# directly in _execute like G50 -- they don't persist as the modal
-# motion_g (unlike G90/G92/G94's re-triggering behavior), since a single
-# invocation is a complete action, not a state that later bare blocks
-# should replay. (G74/G75 aren't documented one way or the other in the
-# excerpts read; treated as one-shot here too, matching G70-G73, as the
-# more conservative choice -- flagged in grooving.py's module docstring.)
-ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0, 74.0, 75.0}
+# G70-G76 are one-shot compound-cycle actions, handled directly in
+# _execute like G50 -- they don't persist as the modal motion_g (unlike
+# G90/G92/G94's re-triggering behavior), since a single invocation is a
+# complete action, not a state that later bare blocks should replay.
+# (G74/G75/G76 aren't documented one way or the other in the excerpts
+# read; treated as one-shot here too, matching G70-G73, as the more
+# conservative choice -- flagged in grooving.py's module docstring.)
+ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0}
 
 END_PROGRAM_M = {2.0, 30.0}
 
@@ -144,6 +143,13 @@ class ModalState:
     # in the same program section.
     g74_e: float = 0.0
     g75_e: float = 0.0
+    # m/r/a (digit-encoded in P)/Δdmin/d for G76, set by a
+    # "G76 P(mmrraa) Q(Δdmin) R(d);" block with no X/Z/U/W.
+    g76_m: int | None = None
+    g76_r: int = 0
+    g76_a: int = 0
+    g76_dmin: float = 0.0
+    g76_d: float = 0.0
 
 
 class Interpreter:
@@ -463,6 +469,9 @@ class Interpreter:
         if one_shot == 75.0:
             self._apply_g75(stmt, by_addr)
             return
+        if one_shot == 76.0:
+            self._apply_g76(stmt, by_addr)
+            return
 
         self._dispatch_motion(stmt, by_addr)
 
@@ -609,6 +618,71 @@ class Interpreter:
             self._append_cycle_moves(moves)
         elif "R" in by_addr:
             self.state.g75_e = to_internal_length(
+                "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+
+    _G76_VALID_TIP_ANGLES = {80, 60, 55, 30, 29, 0}
+
+    def _apply_g76(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        # Unlike G71-G75, G76 uses P for a different purpose in *both*
+        # its setup and trigger blocks (mmrraa digit-code vs. thread
+        # height k), so P's presence can't distinguish them -- the
+        # target X(U)/Z(W) address can, since only the trigger block has
+        # one.
+        has_target = any(addr in by_addr for addr in ("X", "U", "Z", "W"))
+        if has_target:
+            if self.state.g76_m is None:
+                raise ParseError(
+                    f"line {stmt.line_no}: G76 needs m/r/a/Δdmin/d set first by a "
+                    "'G76 P(mmrraa) Q_ R_;' block (no X/Z/U/W)"
+                )
+            target = self._resolve_end_point(stmt, by_addr, self.state.pos)
+            taper_i = (
+                to_internal_length("R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False)
+                if "R" in by_addr else 0.0
+            )
+            thread_height = (
+                to_internal_length("P", by_addr["P"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False)
+                if "P" in by_addr else 0.0
+            )
+            first_cut_depth = (
+                to_internal_length("Q", by_addr["Q"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False)
+                if "Q" in by_addr else 0.0
+            )
+            lead = by_addr["F"][0].value if "F" in by_addr else None
+            moves = thread_cycles.expand_g76(
+                self.state.pos, target, taper_i, thread_height, first_cut_depth,
+                self.state.g76_dmin, self.state.g76_d, self.state.g76_m, lead, stmt.line_no,
+            )
+            self._append_cycle_moves(moves)
+        else:
+            self._set_g76_params(stmt, by_addr)
+
+    def _set_g76_params(self, stmt: NCStatement, by_addr: dict[str, list[ResolvedWord]]) -> None:
+        if "P" in by_addr:
+            rw = by_addr["P"][0]
+            raw = rw.raw_text if rw.raw_text is not None else str(int(rw.value))
+            digits = raw.strip()
+            if not digits.isdigit() or len(digits) > 6:
+                raise ParseError(
+                    f"line {stmt.line_no}: G76 setup P must be an unsigned m(2)+r(2)+a(2) digit code, got {raw!r}"
+                )
+            digits = digits.zfill(6)
+            m, r, a = int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
+            if a not in self._G76_VALID_TIP_ANGLES:
+                raise ParseError(
+                    f"line {stmt.line_no}: G76 tool tip angle a={a} is not one of "
+                    f"{sorted(self._G76_VALID_TIP_ANGLES, reverse=True)}"
+                )
+            self.state.g76_m = m
+            self.state.g76_r = r
+            self.state.g76_a = a
+        if "Q" in by_addr:
+            self.state.g76_dmin = to_internal_length(
+                "Q", by_addr["Q"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
+            )
+        if "R" in by_addr:
+            self.state.g76_d = to_internal_length(
                 "R", by_addr["R"][0].value, unit_scale=self.state.unit_scale, diameter_programming=False
             )
 
