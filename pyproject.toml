@@ -16,6 +16,7 @@ test = ["pytest>=7.0"]
 
 [project.scripts]
 gcode-sim = "gcode_sim.cli:main"
+gcode-sim-gui = "gcode_sim.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["gcode_sim*"]
