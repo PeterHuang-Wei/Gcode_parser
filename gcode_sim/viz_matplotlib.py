@@ -32,6 +32,14 @@ STYLE = {
 # a visual "approach" marker, not the whole traverse.
 RAPID_DISPLAY_LENGTH_MM = 1.0
 
+# The plot's axis range is set explicitly from the *cutting* moves' own
+# bounding box (excluding rapids entirely, even their now-truncated
+# tick), padded by this margin on every side -- otherwise matplotlib's
+# autoscale still includes the full, untruncated rapid *coordinates*
+# (only the drawn line is shortened, not the underlying move), which
+# would silently widen the view back out around a long rapid traverse.
+AXIS_MARGIN_MM = 1.0
+
 
 def _display_point(p: Point, diameter_programming: bool) -> Point:
     z, x = p
@@ -58,6 +66,28 @@ def _move_points(move: Move) -> list[Point]:
     return interpolate_line(move.start, move.end)
 
 
+def _cutting_bounds(
+    toolpath: Toolpath, diameter_programming: bool
+) -> tuple[float, float, float, float] | None:
+    """Bounding box (z_min, z_max, x_min, x_max), in display coordinates,
+    of every *cutting* move (i.e. every kind except "rapid") -- rapids
+    are excluded entirely, not just truncated, so a long traverse can
+    never widen the view. Returns None if the toolpath has no cutting
+    moves at all (nothing to bound)."""
+    zs: list[float] = []
+    xs: list[float] = []
+    for move in toolpath.moves:
+        if move.kind == "rapid":
+            continue
+        for p in _move_points(move):
+            z, x = _display_point(p, diameter_programming)
+            zs.append(z)
+            xs.append(x)
+    if not zs:
+        return None
+    return min(zs), max(zs), min(xs), max(xs)
+
+
 def plot_static(toolpath: Toolpath, diameter_programming: bool = True, ax=None):
     if ax is None:
         _, ax = plt.subplots()
@@ -73,7 +103,19 @@ def plot_static(toolpath: Toolpath, diameter_programming: bool = True, ax=None):
         ax.plot(zs, xs, label=label, **style)
     ax.set_xlabel("Z")
     ax.set_ylabel("X (diameter)" if diameter_programming else "X (radius)")
-    ax.set_aspect("equal", adjustable="datalim")
+    bounds = _cutting_bounds(toolpath, diameter_programming)
+    if bounds is not None:
+        z_min, z_max, x_min, x_max = bounds
+        ax.set_xlim(z_min - AXIS_MARGIN_MM, z_max + AXIS_MARGIN_MM)
+        ax.set_ylim(x_min - AXIS_MARGIN_MM, x_max + AXIS_MARGIN_MM)
+    # adjustable="box" (not "datalim"): keeps the exact cutting-path-based
+    # limits set above and instead reshapes the plot's own box to enforce
+    # equal aspect, so the window's numeric range stays exactly
+    # "cutting path + margin" on both axes rather than being silently
+    # widened to satisfy a 1:1 pixel scale (which is what "datalim" was
+    # doing -- caught by inspecting the actual axis limits before
+    # trusting this).
+    ax.set_aspect("equal", adjustable="box")
     if seen_kinds:
         ax.legend()
     return ax
