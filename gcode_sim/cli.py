@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 
 from .errors import GcodeSimError
 from .simulator import run_file
@@ -28,12 +29,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         try:
-            toolpath = run_file(args.path, ignore_config_path=args.ignore)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                toolpath = run_file(args.path, ignore_config_path=args.ignore)
         except GcodeSimError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+        # Printed explicitly (rather than left to warnings' own default
+        # stderr handling) so a run that skips everything and produces an
+        # empty toolpath always has a visible "why" right next to the
+        # move count, not just whatever scrolled by earlier.
+        for w in caught:
+            print(f"warning: {w.message}", file=sys.stderr)
+
         print(f"{len(toolpath.moves)} moves generated")
+        if not toolpath.moves:
+            print(
+                "note: toolpath is EMPTY -- see the warning(s) above for why "
+                "(e.g. every G-code/variable in the file was skipped)",
+                file=sys.stderr,
+            )
 
         if args.animate or args.plot:
             import matplotlib.pyplot as plt

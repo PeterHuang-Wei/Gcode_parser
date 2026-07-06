@@ -8,6 +8,7 @@ Bracket nesting is capped at 5 levels (cf. PS0118).
 from __future__ import annotations
 
 import math
+import warnings
 
 from .ast_nodes import (
     BinOp,
@@ -17,6 +18,7 @@ from .ast_nodes import (
     FuncCall1,
     FuncCall2,
     Literal,
+    NamedVarRef,
     SimpleCondition,
     UnaryMinus,
     VarRef,
@@ -165,7 +167,7 @@ def _parse_primary(ts: TokenStream) -> Expr:
 
     if tok.kind == "HASH":
         ts.next()
-        return VarRef(_parse_var_index(ts))
+        return parse_hash_value(ts)
 
     if tok.kind == "LBRACKET":
         ts.enter_bracket()
@@ -210,6 +212,27 @@ def parse_var_index(ts: TokenStream) -> Expr:
         ts.exit_bracket()
         return expr
     raise ParseError(f"line {ts.line_no}: expected a variable number after '#'")
+
+
+def parse_hash_value(ts: TokenStream) -> Expr:
+    """Parses what follows a '#' when *reading* a variable's value: a
+    plain number/bracketed expression (the common case, delegates to
+    parse_var_index), or a named alias like #_OFST -- not documented in
+    either manual excerpt read for this project, but a real convention
+    some machines/post-processors use for named system-variable aliases.
+    We don't have the real alias-to-number mapping, so this is accepted
+    syntactically (rather than aborting parsing of the whole program
+    over one unrecognized reference) as a NamedVarRef, which always
+    evaluates to <empty> -- see eval_expr and NamedVarRef's docstring.
+    Only used for reading (expressions, NC-word values); an assignment
+    target (#<index>=...) still requires a real numeric index, via
+    parse_var_index directly, since there's nowhere to write a value
+    for an alias we don't recognize."""
+    tok = ts.peek()
+    if tok is not None and tok.kind == "NAME":
+        ts.next()
+        return NamedVarRef(tok.text)
+    return VarRef(parse_var_index(ts))
 
 
 _parse_var_index = parse_var_index  # internal alias used above
@@ -300,6 +323,11 @@ def eval_expr(expr: Expr, store: VariableStore):
     if isinstance(expr, VarRef):
         index = int(round(arithmetic_value(eval_expr(expr.index_expr, store))))
         return store.get(index)
+    if isinstance(expr, NamedVarRef):
+        warnings.warn(
+            f"unrecognized macro variable alias #{expr.name} -- treating as <empty>", stacklevel=2
+        )
+        return EMPTY
     if isinstance(expr, UnaryMinus):
         return -arithmetic_value(eval_expr(expr.operand, store))
     if isinstance(expr, BinOp):

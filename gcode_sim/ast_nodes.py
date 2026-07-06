@@ -35,6 +35,20 @@ class VarRef(Expr):
 
 
 @dataclass
+class NamedVarRef(Expr):
+    """A named macro-variable alias, e.g. #_OFST -- not documented in
+    either manual excerpt read for this project, but a real convention
+    some machines/post-processors use for named system-variable aliases
+    (typically prefixed with an underscore). Not in variables.py's system
+    variable table (we don't have the real alias-to-number mapping), so
+    this always evaluates to <empty> (see expression.py's eval_expr),
+    with a warning printed rather than aborting parsing of the whole
+    program over one unrecognized reference."""
+
+    name: str  # the text after '#', e.g. "_OFST"
+
+
+@dataclass
 class UnaryMinus(Expr):
     operand: Expr
 

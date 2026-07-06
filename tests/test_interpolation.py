@@ -154,6 +154,28 @@ def test_mixed_known_and_unknown_g_code_skips_the_whole_block():
     assert toolpath.moves[0].end == pytest.approx((10.0, 5.0))
 
 
+def test_unrecognized_named_variable_alias_treated_as_empty_not_a_parse_error():
+    # #_OFST-style named aliases (real convention on some machines/post-
+    # processors, not in either manual excerpt read for this project)
+    # used to raise ParseError ("expected a variable number after '#'")
+    # and abort parsing of the *entire* program over one reference.
+    # #100=#_OFST leaves #100 as <empty>; the Z address later resolves to
+    # <empty> too and is dropped per manual 16.1 (an address that
+    # resolves to an undefined/empty variable is ignored, as if never
+    # given), so Z stays at its prior value (100.0 from G50).
+    with pytest.warns(UserWarning, match="_OFST"):
+        toolpath = simulator.run(
+            """
+            G50 X50.0 Z100.0;
+            #100=#_OFST;
+            G00 X10.0 Z#_OFST;
+            M30;
+            """
+        )
+    assert len(toolpath.moves) == 1
+    assert toolpath.moves[0].end == pytest.approx((100.0, 5.0))
+
+
 def test_m98_to_undefined_program_raises_clear_error():
     # M98/#-assignment are implemented starting Phase 1 (see
     # test_control_flow.py / test_expression.py); this now only checks

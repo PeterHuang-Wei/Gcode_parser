@@ -41,6 +41,17 @@ def test_unary_minus():
     assert ev("-#1", store) == -3.0
 
 
+def test_named_variable_alias_evaluates_to_empty_with_a_warning():
+    # #_OFST-style named aliases aren't documented in either manual
+    # excerpt read for this project, but are a real convention some
+    # machines/post-processors use -- accepted syntactically (not a
+    # ParseError that would abort the whole program) and treated as
+    # <empty>, with a warning so it's still clear something wasn't
+    # understood (see NamedVarRef's docstring in ast_nodes.py).
+    with pytest.warns(UserWarning, match="_OFST"):
+        assert ev("#_OFST") is EMPTY
+
+
 def test_functions():
     assert ev("SIN[90]") == pytest.approx(1.0)
     assert ev("COS[0]") == pytest.approx(1.0)

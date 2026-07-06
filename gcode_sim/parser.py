@@ -25,7 +25,13 @@ from .ast_nodes import (
     WhileDo,
 )
 from .errors import ParseError
-from .expression import TokenStream, parse_condition_tokens, parse_expression_tokens, parse_var_index
+from .expression import (
+    TokenStream,
+    parse_condition_tokens,
+    parse_expression_tokens,
+    parse_hash_value,
+    parse_var_index,
+)
 from .lexer import RawStatement, Word, split_into_statements, tokenize_macro_stmt
 
 _CONTROL_KEYWORDS_RE = re.compile(r"^(GOTO|IF|WHILE|DO|END)", re.IGNORECASE)
@@ -177,7 +183,7 @@ def _parse_nc_word_value(ts: TokenStream, address: str, raw: RawStatement) -> Wo
 
     if tok is not None and tok.kind == "HASH":
         ts.next()
-        expr = VarRef(parse_var_index(ts))
+        expr = parse_hash_value(ts)
         if negative:
             expr = UnaryMinus(expr)
         return Word(address=address, expr=expr)

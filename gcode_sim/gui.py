@@ -9,6 +9,7 @@ engine, not a separate implementation. No web server, no browser.
 from __future__ import annotations
 
 import tkinter as tk
+import warnings
 from tkinter import filedialog, messagebox, scrolledtext
 
 import matplotlib
@@ -70,6 +71,22 @@ class SimulatorApp:
         NavigationToolbar2Tk(self.canvas, plot_frame).update()
         body.add(plot_frame, minsize=300)
 
+        # Warnings raised during a run (e.g. an unrecognized G-code/macro
+        # variable alias that got skipped) go to Python's warnings module,
+        # which by default only prints to stderr -- easy to miss entirely
+        # in a windowed app with no visible console, and the single most
+        # likely reason a run silently produces an empty/wrong-looking
+        # toolpath with no obvious cause. Shown here instead so the
+        # "why" is never just invisible.
+        warnings_frame = tk.Frame(root)
+        warnings_frame.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(warnings_frame, text="Warnings from last run", anchor="w", fg="gray30").pack(
+            side=tk.TOP, fill=tk.X
+        )
+        self.warnings_text = scrolledtext.ScrolledText(warnings_frame, height=5, wrap=tk.WORD, fg="darkorange4")
+        self.warnings_text.pack(side=tk.TOP, fill=tk.X)
+        self.warnings_text.configure(state=tk.DISABLED)
+
     def _show_code(self, path: str) -> None:
         try:
             with open(path, encoding="utf-8") as f:
@@ -83,7 +100,15 @@ class SimulatorApp:
 
     def open_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="Open NC program", filetypes=[("NC programs", "*.nc"), ("All files", "*.*")]
+            title="Open NC program",
+            # Windows/macOS dialogs match extensions case-insensitively;
+            # Linux (GTK) ones can be case-sensitive, so both cases are
+            # listed explicitly to make sure ".CNC"/".TXT" (as well as
+            # the lowercase forms) show up on every platform.
+            filetypes=[
+                ("NC programs", "*.nc *.NC *.cnc *.CNC *.txt *.TXT"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
@@ -103,17 +128,28 @@ class SimulatorApp:
         self.ignore_path = path
         self.status_label.config(text=f"Ignore list: {path}")
 
+    def _set_warnings_text(self, lines: list[str]) -> None:
+        self.warnings_text.configure(state=tk.NORMAL)
+        self.warnings_text.delete("1.0", tk.END)
+        self.warnings_text.insert(tk.END, "\n".join(lines) if lines else "(none)")
+        self.warnings_text.configure(state=tk.DISABLED)
+
     def run(self) -> None:
         if not self.path:
             return
         self._animation = None
         self.ax.clear()
         try:
-            toolpath = run_file(self.path, ignore_config_path=self.ignore_path)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                toolpath = run_file(self.path, ignore_config_path=self.ignore_path)
         except (GcodeSimError, OSError) as exc:
             messagebox.showerror("Simulation error", str(exc))
             self.status_label.config(text=f"error: {exc}")
             return
+
+        warning_lines = [str(w.message) for w in caught]
+        self._set_warnings_text(warning_lines)
 
         diameter = self.diameter_var.get()
         if self.animate_var.get():
@@ -121,7 +157,13 @@ class SimulatorApp:
         else:
             plot_static(toolpath, diameter_programming=diameter, ax=self.ax)
         self.canvas.draw()
-        self.status_label.config(text=f"{len(toolpath.moves)} moves generated")
+
+        status = f"{len(toolpath.moves)} moves generated"
+        if warning_lines:
+            status += f" -- {len(warning_lines)} warning(s), see panel below"
+        if not toolpath.moves:
+            status += " -- toolpath is EMPTY; check the warnings panel and loaded code for why"
+        self.status_label.config(text=status)
 
 
 def main() -> None:
