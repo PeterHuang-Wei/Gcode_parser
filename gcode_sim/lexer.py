@@ -138,16 +138,22 @@ def tokenize_nc_words(stmt: str, line_no: int) -> list[Word]:
 
 
 def tokenize_macro_stmt(stmt: str, line_no: int) -> list[Token]:
+    """This is the tokenizer the real parsing pipeline uses (parser.py's
+    _ts_for) -- unlike the legacy tokenize_nc_words()/tokenize() below
+    (kept strict for their own Phase-0 tests), an unrecognized character
+    here is skipped rather than aborting the whole statement: real-world
+    NC files sometimes carry vendor-specific noise (stray punctuation,
+    odd control characters) that isn't part of this dialect's grammar,
+    and a single bad character shouldn't take down parsing of an
+    otherwise-valid block."""
     tokens: list[Token] = []
     pos = 0
     n = len(stmt)
     while pos < n:
         m = MACRO_TOKEN_RE.match(stmt, pos)
         if not m:
-            remainder = stmt[pos:].strip()
-            if not remainder:
-                break
-            raise LexError(f"line {line_no}: unrecognized token near {stmt[pos:pos + 10]!r}")
+            pos += 1
+            continue
         kind = m.lastgroup
         assert kind is not None
         tokens.append(Token(kind=kind, text=m.group(kind)))

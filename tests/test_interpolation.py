@@ -101,7 +101,10 @@ def test_g50_s_sets_max_spindle_rpm_without_creating_a_move():
 
 def test_unsupported_g_code_raises_clear_error():
     # G70-G76 are all implemented (Phase 4); work coordinate systems
-    # (G54-G59) and reference point return (G28/G30) are not.
+    # (G54-G59) and reference point return (G28/G30) are not -- these are
+    # documented FANUC lathe codes with real motion/state effects that
+    # this simulator deliberately hasn't modeled yet, so they still raise
+    # (unlike a totally foreign G-code, see the G88 test below).
     with pytest.raises(UnsupportedFeatureError):
         simulator.run(
             """
@@ -109,6 +112,45 @@ def test_unsupported_g_code_raises_clear_error():
             M30;
             """
         )
+
+
+def test_totally_unrecognized_g_code_is_skipped_with_a_warning():
+    # G88 isn't part of this (or any real FANUC lathe) dialect at all --
+    # e.g. a machining-center-only cycle from a different post-processor.
+    # The whole block is skipped (not just the G-word): its other
+    # addresses (X/Y/Z here) could be parameters specific to that foreign
+    # cycle, not ordinary motion, so partially applying them could
+    # silently produce a wrong path.
+    with pytest.warns(UserWarning, match="G88"):
+        toolpath = simulator.run(
+            """
+            G50 X50.0 Z100.0;
+            G88 X1.0 Y2.0 Z3.0;
+            G00 X10.0 Z10.0;
+            M30;
+            """
+        )
+    assert len(toolpath.moves) == 1
+    assert toolpath.moves[0].end == pytest.approx((10.0, 5.0))
+
+
+def test_mixed_known_and_unknown_g_code_skips_the_whole_block():
+    # A block combining a recognized code (G00) with an unrecognized one
+    # (G88) is skipped entirely too -- not just the unrecognized part --
+    # since it's ambiguous whether the recognized code's usual meaning
+    # still applies when paired with a code this dialect knows nothing
+    # about.
+    with pytest.warns(UserWarning, match="G88"):
+        toolpath = simulator.run(
+            """
+            G50 X50.0 Z100.0;
+            G00 G88 X1.0 Z3.0;
+            G00 X10.0 Z10.0;
+            M30;
+            """
+        )
+    assert len(toolpath.moves) == 1
+    assert toolpath.moves[0].end == pytest.approx((10.0, 5.0))
 
 
 def test_m98_to_undefined_program_raises_clear_error():

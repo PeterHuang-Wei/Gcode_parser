@@ -1,7 +1,7 @@
 import pytest
 
 from gcode_sim.errors import LexError, UnsupportedFeatureError
-from gcode_sim.lexer import tokenize
+from gcode_sim.lexer import tokenize, tokenize_macro_stmt
 
 
 def test_basic_block():
@@ -53,8 +53,21 @@ def test_macro_keyword_rejected():
 
 
 def test_unrecognized_token_raises_lex_error():
+    # This is the legacy Phase-0 tokenize() path, kept strict for its own
+    # tests -- the real pipeline (tokenize_macro_stmt, tested just below)
+    # is intentionally more lenient about stray noise characters.
     with pytest.raises(LexError):
         tokenize("G0 @@@ X10.0;")
+
+
+def test_tokenize_macro_stmt_skips_unrecognized_noise_characters():
+    # The tokenizer parser.py actually uses skips a stray character it
+    # doesn't recognize (real-world NC files sometimes carry vendor-
+    # specific punctuation/control characters) instead of raising --
+    # the surrounding valid tokens should still come through intact.
+    tokens = tokenize_macro_stmt("G0 @@@ X10.0", line_no=1)
+    kinds_and_text = [(t.kind, t.text) for t in tokens]
+    assert kinds_and_text == [("NAME", "G"), ("NUMBER", "0"), ("NAME", "X"), ("NUMBER", "10.0")]
 
 
 def test_no_g_word_block():

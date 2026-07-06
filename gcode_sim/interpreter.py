@@ -25,11 +25,23 @@ G-codes is active (manual 4.1.6's "沒有移動指令的程序段" -- this is
 intentional, not a bug, and is exactly the surprising behavior the
 manual warns users to guard against with an explicit G00/G01 first).
 
-Compound canned cycles (G70-G76) and tool compensation are not
-supported yet; encountering their G-codes raises UnsupportedFeatureError
-rather than being silently ignored or misinterpreted.
+Phase 4 adds the compound canned cycles G70-G76 (canned_cycles/contour.py,
+roughing.py, pattern_repeat.py, grooving.py, threading.py). Tool
+compensation is not supported yet.
+
+G-codes this simulator has *heard of* but deliberately hasn't implemented
+(work coordinate systems, reference point return -- see UNSUPPORTED_G)
+still raise UnsupportedFeatureError: silently ignoring one of these could
+produce a wrong path, not just missing metadata, since they're documented
+FANUC lathe codes with real motion/state effects. A G-code this simulator
+has *never heard of at all* (e.g. a machining-center-only cycle from a
+different post-processor/machine) is instead skipped with a warning --
+real-world NC files sometimes carry codes outside this dialect's scope
+entirely, and a single foreign G-code shouldn't abort an otherwise
+simulatable program.
 """
 
+import warnings
 from dataclasses import dataclass
 
 from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
@@ -82,6 +94,12 @@ UNSUPPORTED_G = {
 # read; treated as one-shot here too, matching G70-G73, as the more
 # conservative choice -- flagged in grooving.py's module docstring.)
 ONE_SHOT_CYCLE_G = {70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0}
+
+# Every G-code this dialect recognizes at all (whether implemented,
+# inert, or a known-but-deferred UNSUPPORTED_G) -- used to detect a
+# block containing a code this simulator has *never heard of*, see
+# _execute's upfront check.
+KNOWN_G_CODES = SIMPLE_MOTION_G | CANNED_CYCLE_G | INERT_G | UNSUPPORTED_G | ONE_SHOT_CYCLE_G | {20.0, 21.0, 50.0}
 
 END_PROGRAM_M = {2.0, 30.0}
 
@@ -438,6 +456,21 @@ class Interpreter:
         by_addr = self._group_by_address(stmt)
 
         g_words = by_addr.get("G", [])
+        unknown = [rw.value for rw in g_words if rw.value not in KNOWN_G_CODES]
+        if unknown:
+            # A code this dialect has never heard of at all (e.g. a
+            # machining-center-only cycle like G88 from a different
+            # machine/post-processor) -- skip the *whole* block, not just
+            # the G-word: the block's other addresses may be parameters
+            # specific to that foreign cycle, not ordinary X/Z motion, so
+            # partially interpreting them could silently produce a wrong
+            # path (caught by hand-testing: a bare "G88 X1.0 Z3.0;" was
+            # otherwise falling through to _dispatch_motion and either
+            # misinterpreting X/Z as a motion command or raising a
+            # confusing "no motion G-code yet" error).
+            codes = ", ".join(f"G{c:g}" for c in unknown)
+            warnings.warn(f"line {stmt.line_no}: ignoring block with unrecognized G-code(s) {codes}", stacklevel=2)
+            return
         is_g50 = any(rw.value == 50.0 for rw in g_words)
         one_shot = next((rw.value for rw in g_words if rw.value in ONE_SHOT_CYCLE_G), None)
         motion_group_words = [rw for rw in g_words if rw.value != 50.0 and rw.value not in ONE_SHOT_CYCLE_G]
@@ -719,7 +752,11 @@ class Interpreter:
                     f"G{code:g} is recognized but not implemented until a later phase"
                 )
             else:
-                raise UnsupportedFeatureError(f"unrecognized G-code: G{code:g}")
+                # Unreachable: _execute() already filters out any block
+                # containing a G-code not in KNOWN_G_CODES (which is a
+                # superset of every set checked above) before calling
+                # this method.
+                raise AssertionError(f"G{code:g} reached _apply_g_codes despite not being in KNOWN_G_CODES")
 
     def _apply_g50(self, by_addr: dict[str, list[ResolvedWord]]) -> None:
         z, x = self.state.pos
