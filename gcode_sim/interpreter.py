@@ -44,12 +44,28 @@ simulatable program.
 import warnings
 from dataclasses import dataclass
 
-from .ast_nodes import Assignment, EndDo, Goto, IfGoto, IfThen, NCStatement, WhileDo
+from .ast_nodes import (
+    Assignment,
+    BinOp,
+    EndDo,
+    Expr,
+    FuncCall1,
+    FuncCall2,
+    Goto,
+    IfGoto,
+    IfThen,
+    Literal,
+    NCStatement,
+    UnaryMinus,
+    VarRef,
+    WhileDo,
+)
 from .canned_cycles import contour, grooving, pattern_repeat, roughing
 from .canned_cycles import threading as thread_cycles
 from .canned_cycles import turning
 from .errors import MacroError, ParseError, UnsupportedFeatureError
 from .expression import eval_condition, eval_expr
+from .ignore_config import IgnoreConfig
 from .lexer import Word
 from .motion import arc_center_from_offset, arc_center_from_radius
 from .tool_table import ToolTable
@@ -171,13 +187,14 @@ class ModalState:
 
 
 class Interpreter:
-    def __init__(self, tool_table: ToolTable | None = None):
+    def __init__(self, tool_table: ToolTable | None = None, ignore_config: IgnoreConfig | None = None):
         self.state = ModalState()
         self.tool_table = tool_table if tool_table is not None else ToolTable()
         self.toolpath = Toolpath()
         self.variables = VariableStore()
         self.variables.bind_position_provider(lambda: self.state.pos)
         self.registry = None
+        self.ignore_config = ignore_config if ignore_config is not None else IgnoreConfig()
         self._subprogram_depth = 0
         self._macro_depth = 0
         self._call_depth = 0
@@ -214,6 +231,8 @@ class Interpreter:
 
     def _execute_one(self, stmt, index: int, seq_index, do_to_end, end_to_do):
         if isinstance(stmt, NCStatement):
+            if self._should_ignore_nc_statement(stmt):
+                return None
             if self._ends_program(stmt):
                 raise _EndOfProgram()
             call = self._get_call(stmt)
@@ -230,6 +249,8 @@ class Interpreter:
             return None
 
         if isinstance(stmt, Assignment):
+            if self._should_ignore_assignment(stmt):
+                return None
             self._exec_assignment(stmt)
             return None
 
@@ -451,6 +472,34 @@ class Interpreter:
                 continue
             by_addr.setdefault(w.address, []).append(ResolvedWord(value=value, raw_text=w.value))
         return by_addr
+
+    def _should_ignore_nc_statement(self, stmt: NCStatement) -> bool:
+        """User-configured ignore list (ignore_config.py): a G-code or
+        #variable the user has explicitly flagged skips this *whole*
+        statement, not just the matching word -- same reasoning as the
+        automatic unknown-G-code skip in _execute (a partially-applied
+        line could silently produce a wrong path)."""
+        cfg = self.ignore_config
+        if not cfg.g_codes and not cfg.variables:
+            return False
+        for w in stmt.words:
+            if w.address == "G" and w.value is not None:
+                try:
+                    if float(w.value) in cfg.g_codes:
+                        return True
+                except ValueError:
+                    pass
+            if w.expr is not None and _expr_references_variable(w.expr, cfg.variables):
+                return True
+        return False
+
+    def _should_ignore_assignment(self, stmt: Assignment) -> bool:
+        cfg = self.ignore_config
+        if not cfg.variables:
+            return False
+        if isinstance(stmt.target.index_expr, Literal) and int(stmt.target.index_expr.value) in cfg.variables:
+            return True
+        return _expr_references_variable(stmt.expr, cfg.variables)
 
     def _execute(self, stmt: NCStatement) -> None:
         by_addr = self._group_by_address(stmt)
@@ -901,6 +950,28 @@ class Interpreter:
 
 
 # ------------------------------------------------------------ free helpers
+
+def _expr_references_variable(expr: Expr, indices: set[int]) -> bool:
+    """Recursively checks whether expr contains a VarRef to one of the
+    given, statically-known (i.e. Literal-indexed) variable numbers --
+    used by the ignore-list checks above. A dynamically-computed index
+    (e.g. #[#100]) can't be matched without evaluating it, so it's simply
+    not matched; the ignore list is a best-effort escape hatch for plain
+    "#500"-style references, not a full data-flow analysis."""
+    if isinstance(expr, VarRef):
+        if isinstance(expr.index_expr, Literal) and int(expr.index_expr.value) in indices:
+            return True
+        return _expr_references_variable(expr.index_expr, indices)
+    if isinstance(expr, UnaryMinus):
+        return _expr_references_variable(expr.operand, indices)
+    if isinstance(expr, BinOp):
+        return _expr_references_variable(expr.left, indices) or _expr_references_variable(expr.right, indices)
+    if isinstance(expr, FuncCall1):
+        return _expr_references_variable(expr.arg, indices)
+    if isinstance(expr, FuncCall2):
+        return _expr_references_variable(expr.arg1, indices) or _expr_references_variable(expr.arg2, indices)
+    return False
+
 
 def _as_float(value) -> float:
     if value is EMPTY:

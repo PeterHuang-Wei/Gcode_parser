@@ -1,0 +1,13 @@
+# Example ignore-list file for gcode-sim (see gcode_sim/ignore_config.py).
+# One entry per line: "G<number>" or "#<number>". Blank lines and
+# anything else are silently skipped. Pass this file via:
+#   gcode-sim run foo.nc --ignore examples/ignore_example.txt
+# or the desktop GUI's "Ignore list..." button.
+#
+# This line itself (starting with '#' followed by non-digits) is not a
+# valid "#<number>" entry, so it's just skipped like a comment -- but
+# note a real "#500" line below WOULD be treated as ignoring macro
+# variable #500, not as a comment.
+
+G88
+#500

@@ -27,6 +27,7 @@ class SimulatorApp:
         self.root = root
         root.title("G-code Simulator")
         self.path: str | None = None
+        self.ignore_path: str | None = None
         self._animation = None  # kept alive: FuncAnimation stops if garbage collected
 
         toolbar = tk.Frame(root)
@@ -35,6 +36,7 @@ class SimulatorApp:
         tk.Button(toolbar, text="Open .nc...", command=self.open_file).pack(side=tk.LEFT, padx=4, pady=4)
         self.run_button = tk.Button(toolbar, text="Run", command=self.run, state=tk.DISABLED)
         self.run_button.pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Button(toolbar, text="Ignore list...", command=self.open_ignore_file).pack(side=tk.LEFT, padx=4, pady=4)
 
         self.animate_var = tk.BooleanVar(value=False)
         tk.Checkbutton(toolbar, text="Animate", variable=self.animate_var).pack(side=tk.LEFT, padx=4, pady=4)
@@ -64,13 +66,23 @@ class SimulatorApp:
         self.run_button.config(state=tk.NORMAL)
         self.status_label.config(text="Loaded. Click Run to simulate.")
 
+    def open_ignore_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open ignore-list file (one 'G<n>' or '#<n>' per line)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.ignore_path = path
+        self.status_label.config(text=f"Ignore list: {path}")
+
     def run(self) -> None:
         if not self.path:
             return
         self._animation = None
         self.ax.clear()
         try:
-            toolpath = run_file(self.path)
+            toolpath = run_file(self.path, ignore_config_path=self.ignore_path)
         except (GcodeSimError, OSError) as exc:
             messagebox.showerror("Simulation error", str(exc))
             self.status_label.config(text=f"error: {exc}")

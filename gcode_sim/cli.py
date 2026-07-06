@@ -1,4 +1,4 @@
-"""Command-line entry point: gcode-sim run foo.nc [--plot] [--animate]"""
+"""Command-line entry point: gcode-sim run foo.nc [--plot] [--animate] [--ignore ignore.txt]"""
 
 from __future__ import annotations
 
@@ -17,12 +17,18 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("path", help="Path to the .nc source file")
     run_parser.add_argument("--plot", action="store_true", help="Show a static plot of the toolpath")
     run_parser.add_argument("--animate", action="store_true", help="Show a continuous playback animation")
+    run_parser.add_argument(
+        "--ignore",
+        metavar="FILE",
+        help="Path to an ignore-list file (see gcode_sim/ignore_config.py): "
+        "one 'G<n>' or '#<n>' per line to force-skip that G-code/variable",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "run":
         try:
-            toolpath = run_file(args.path)
+            toolpath = run_file(args.path, ignore_config_path=args.ignore)
         except GcodeSimError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
