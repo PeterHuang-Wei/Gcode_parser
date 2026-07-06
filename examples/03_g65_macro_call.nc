@@ -1,0 +1,11 @@
+O0001 (G65 MACRO CALL EXAMPLE, ADAPTED FROM THE MANUAL'S G65/O9010 EXAMPLE) ;
+(mill-style G91 X_ is replaced with U_, since this lathe dialect uses X/U) ;
+G50 X0.0 Z0.0 ;
+G65 P9010 L2 A1.0 B2.0 ;
+M30 ;
+
+O9010 (ADD A+B INTO #3; MOVE INCREMENTAL X BY THAT AMOUNT UNLESS >360) ;
+#3=#1+#2 ;
+IF[#3 GT 360] GOTO9 ;
+G00 U#3 ;
+N9 M99 ;

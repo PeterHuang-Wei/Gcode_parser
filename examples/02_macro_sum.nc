@@ -1,0 +1,8 @@
+O9500 (SUM 1 TO 10 VIA GOTO -- MANUAL EXAMPLE) ;
+#1=0 ;
+#2=1 ;
+N1 IF[#2 GT 10] GOTO2 ;
+#1=#1+#2 ;
+#2=#2+1 ;
+GOTO1 ;
+N2 M30 ;

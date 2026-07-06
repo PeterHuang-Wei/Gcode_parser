@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcode-sim"
+version = "0.1.0"
+description = "FANUC lathe G-code path simulator (parser + macro interpreter + visualization)"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+gcode-sim = "gcode_sim.cli:main"
+gcode-sim-gui = "gcode_sim.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["gcode_sim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
