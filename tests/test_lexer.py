@@ -20,6 +20,26 @@ def test_sequence_number_extracted():
     assert [(w.address, w.value) for w in blocks[0].words] == [("G", "01"), ("X", "5.0")]
 
 
+def test_sequence_number_found_when_not_the_first_word():
+    # The manual conventionally shows N leading every block, but doesn't
+    # actually require that position -- some real NC files/post-
+    # processors put it elsewhere (e.g. trailing), and this must still
+    # be usable as a G70/71/72/73 P/Q reference point.
+    blocks = tokenize("G01 X5.0 N210;")
+    assert blocks[0].seq_no == 210
+    assert [(w.address, w.value) for w in blocks[0].words] == [("G", "01"), ("X", "5.0")]
+
+
+def test_bare_sequence_number_label_is_preserved():
+    # A block that's *only* a sequence number (no other words at all) is
+    # a valid way to mark a P/Q reference point -- it must not be
+    # silently dropped just because it has no motion words.
+    blocks = tokenize("N210;")
+    assert len(blocks) == 1
+    assert blocks[0].seq_no == 210
+    assert blocks[0].words == []
+
+
 def test_comment_stripped():
     blocks = tokenize("G0 X10.0 (rapid to start) Z5.0;")
     words = {(w.address, w.value) for w in blocks[0].words}

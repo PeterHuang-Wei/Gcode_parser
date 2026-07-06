@@ -26,6 +26,13 @@ from .errors import LexError, UnsupportedFeatureError
 COMMENT_RE = re.compile(r"\([^)]*\)")
 NC_WORD_RE = re.compile(r"([A-Za-z])\s*([+-]?(?:\d+\.?\d*|\.\d+))")
 SEQ_NO_RE = re.compile(r"^[Nn](\d+)\s*(.*)$", re.DOTALL)
+# Fallback for a sequence number that isn't the block's first word (e.g.
+# trailing "G00 X20.0 N203;", or a bare "N210;" label with nothing else
+# -- both real, valid FANUC constructs used to mark a G70/71/72/73 P/Q
+# reference point that isn't attached to any particular motion word).
+# The manual conventionally shows N leading every example, but never
+# actually requires that position -- see split_into_statements.
+MID_SEQ_NO_RE = re.compile(r"(?<![A-Za-z0-9_])[Nn](\d+)")
 
 MACRO_CHARS = set("#=[]")
 MACRO_KEYWORDS = ("GOTO", "IF", "WHILE", "DO", "END")
@@ -87,6 +94,22 @@ class Token:
     text: str
 
 
+def _extract_seq_no(stmt: str) -> tuple[int | None, str]:
+    """Finds this block's sequence number (N<digits>), wherever it
+    appears, and strips it out -- checking the leading position first
+    (fast path, the common case shown throughout the manual), then
+    falling back to a standalone N<digits> token anywhere else in the
+    block. Returns (seq_no, remaining_text)."""
+    m = SEQ_NO_RE.match(stmt)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+    m = MID_SEQ_NO_RE.search(stmt)
+    if m:
+        remainder = (stmt[: m.start()] + " " + stmt[m.end() :]).strip()
+        return int(m.group(1)), remainder
+    return None, stmt
+
+
 def split_into_statements(source: str) -> list[RawStatement]:
     statements: list[RawStatement] = []
     for line_no, raw_line in enumerate(source.splitlines(), start=1):
@@ -100,12 +123,12 @@ def split_into_statements(source: str) -> list[RawStatement]:
             skip = stmt.startswith("/")
             if skip:
                 stmt = stmt[1:].strip()
-            seq_no = None
-            m = SEQ_NO_RE.match(stmt)
-            if m:
-                seq_no = int(m.group(1))
-                stmt = m.group(2).strip()
-            if not stmt:
+            seq_no, stmt = _extract_seq_no(stmt)
+            # A statement that's empty after removing its N-word is only
+            # dropped if it never had one -- a bare "N210;" label (no
+            # other words at all) is a valid, if unusual, way to mark a
+            # P/Q reference point and must still be recorded.
+            if not stmt and seq_no is None:
                 continue
             statements.append(RawStatement(seq_no=seq_no, skip=skip, text=stmt, line_no=line_no))
     return statements

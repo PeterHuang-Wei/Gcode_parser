@@ -26,6 +26,26 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 RETREAT = 1.0 / math.sqrt(2)
 
 
+def test_g71_p_q_finds_sequence_numbers_that_are_not_the_first_word():
+    # Real NC files sometimes place N<seq> after other words in the block
+    # (e.g. "G00 X20.0 N203;") instead of leading it -- contour.find_range
+    # must still be able to locate ns/nf via lexer.py's fallback (see
+    # test_lexer.py's coverage of the lexer-level fix), not just fail
+    # with "sequence number not found".
+    toolpath = simulator.run(
+        """
+        G50 X44.0 Z2.0;
+        G71 U2.0 R1.0;
+        G71 P203 Q210 U1.0 W0.5 F0.2;
+        G00 X20.0 N203;
+        G01 Z-30.0 N210 F0.15;
+        M30;
+        """
+    )
+    assert len(toolpath.moves) > 0
+    assert toolpath.moves[-1].end == pytest.approx((-30.0, 10.0))
+
+
 def test_g71_roughs_a_plain_cylindrical_turn():
     # S=(z=2,x=22). Shape: N10 G00 X20.0 (diameter -> A'=(2,10), radius),
     # N20 G01 Z-30.0 (-> B=(-30,10)). Delta d=2.0 (radius, U on the
