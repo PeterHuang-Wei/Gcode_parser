@@ -139,7 +139,12 @@ class VariableStore:
     def _get_system(self, index: int) -> Value:
         if self._position_provider is not None:
             z, x = self._position_provider()
-            if index in (5001, 5021):
+            if index in (5001, 5021, 2601):
+                # #2601 is not in either manual excerpt read for this
+                # project -- added per the user's own machine/post-
+                # processor convention, where it's used the same way as
+                # #5001 (current Z position), e.g. in a "G50 Z#2601;"
+                # block that re-declares the current position as itself.
                 return z
             if index in (5002, 5022):
                 return x

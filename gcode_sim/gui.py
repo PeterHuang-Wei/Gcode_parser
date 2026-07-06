@@ -9,7 +9,7 @@ engine, not a separate implementation. No web server, no browser.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, scrolledtext
 
 import matplotlib
 
@@ -49,11 +49,37 @@ class SimulatorApp:
         self.status_label = tk.Label(root, text="", anchor="w", fg="gray20")
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=2)
 
+        # Left: the loaded program's raw source text (read-only). Right:
+        # the plotted toolpath. A PanedWindow lets the user resize either
+        # side to see more code or more of the plot.
+        body = tk.PanedWindow(root, orient=tk.HORIZONTAL, sashwidth=4)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        code_frame = tk.Frame(body)
+        tk.Label(code_frame, text="Loaded program", anchor="w", fg="gray30").pack(side=tk.TOP, fill=tk.X)
+        self.code_text = scrolledtext.ScrolledText(code_frame, wrap=tk.NONE, width=48, font=("Courier", 10))
+        self.code_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.code_text.configure(state=tk.DISABLED)
+        body.add(code_frame, minsize=200)
+
+        plot_frame = tk.Frame(body)
         self.figure = Figure(figsize=(7, 6))
         self.ax = self.figure.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=root)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, root).update()
+        NavigationToolbar2Tk(self.canvas, plot_frame).update()
+        body.add(plot_frame, minsize=300)
+
+    def _show_code(self, path: str) -> None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+        except OSError as exc:
+            source = f"(could not read file for display: {exc})"
+        self.code_text.configure(state=tk.NORMAL)
+        self.code_text.delete("1.0", tk.END)
+        self.code_text.insert(tk.END, source)
+        self.code_text.configure(state=tk.DISABLED)
 
     def open_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -65,6 +91,7 @@ class SimulatorApp:
         self.path_label.config(text=path)
         self.run_button.config(state=tk.NORMAL)
         self.status_label.config(text="Loaded. Click Run to simulate.")
+        self._show_code(path)
 
     def open_ignore_file(self) -> None:
         path = filedialog.askopenfilename(

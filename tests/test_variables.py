@@ -71,6 +71,16 @@ def test_system_variable_reads_current_position():
     assert store.get(5002) == 7.5
 
 
+def test_variable_2601_reads_current_z_position():
+    # Not in either manual excerpt read for this project -- added per the
+    # user's own machine/post-processor convention, where #2601 is used
+    # the same way as #5001 (current Z position), e.g. in a
+    # "G50 Z#2601;" block that re-declares the current position as itself.
+    store = VariableStore()
+    store.bind_position_provider(lambda: (-12.5, 7.5))
+    assert store.get(2601) == -12.5
+
+
 def test_unsupported_system_variable_raises_clear_error():
     store = VariableStore()
     with pytest.raises(MacroError):

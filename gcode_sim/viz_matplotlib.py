@@ -9,6 +9,8 @@ from F.
 
 from __future__ import annotations
 
+import math
+
 import matplotlib.pyplot as plt
 from matplotlib import animation as mpl_animation
 
@@ -22,10 +24,31 @@ STYLE = {
     "thread": {"linestyle": "-", "color": "tab:red", "linewidth": 1.5},
 }
 
+# A rapid (G00) traverse is frequently much longer than the actual cutting
+# geometry (e.g. a retract all the way out to a clearance position) --
+# drawing it at full length visually dominates the plot and makes the
+# cutting path (what actually matters for checking a program) hard to
+# read. Only the last RAPID_DISPLAY_LENGTH_MM of each rapid is drawn, as
+# a visual "approach" marker, not the whole traverse.
+RAPID_DISPLAY_LENGTH_MM = 1.0
+
 
 def _display_point(p: Point, diameter_programming: bool) -> Point:
     z, x = p
     return (z, x * 2.0 if diameter_programming else x)
+
+
+def _rapid_display_points(move: Move) -> list[Point]:
+    """Truncates a rapid move's drawn line to its last RAPID_DISPLAY_
+    LENGTH_MM, leaving the move itself (and the animated tool marker's
+    real path, see animate() below) untouched -- this only affects what
+    gets drawn."""
+    (z0, x0), (z1, x1) = move.start, move.end
+    length = math.hypot(z1 - z0, x1 - x0)
+    if length <= RAPID_DISPLAY_LENGTH_MM:
+        return [move.start, move.end]
+    t = (length - RAPID_DISPLAY_LENGTH_MM) / length
+    return [(z0 + t * (z1 - z0), x0 + t * (x1 - x0)), (z1, x1)]
 
 
 def _move_points(move: Move) -> list[Point]:
@@ -40,7 +63,8 @@ def plot_static(toolpath: Toolpath, diameter_programming: bool = True, ax=None):
         _, ax = plt.subplots()
     seen_kinds: set[str] = set()
     for move in toolpath.moves:
-        pts = [_display_point(p, diameter_programming) for p in _move_points(move)]
+        raw_points = _rapid_display_points(move) if move.kind == "rapid" else _move_points(move)
+        pts = [_display_point(p, diameter_programming) for p in raw_points]
         zs = [p[0] for p in pts]
         xs = [p[1] for p in pts]
         style = STYLE[move.kind]
