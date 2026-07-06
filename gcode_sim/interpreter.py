@@ -98,6 +98,7 @@ INERT_G = {17.0, 18.0, 19.0, 40.0, 41.0, 42.0, 96.0, 97.0, 98.0, 99.0}
 # than silently no-op'ing) matters because ignoring these would silently
 # produce a wrong path, not just missing metadata.
 UNSUPPORTED_G = {
+    10.0,  # programmable data input (sets work/tool offsets)
     28.0, 30.0,  # reference point return
     54.0, 55.0, 56.0, 57.0, 58.0, 59.0,  # work coordinate systems
 }

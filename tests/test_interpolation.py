@@ -101,17 +101,18 @@ def test_g50_s_sets_max_spindle_rpm_without_creating_a_move():
 
 def test_unsupported_g_code_raises_clear_error():
     # G70-G76 are all implemented (Phase 4); work coordinate systems
-    # (G54-G59) and reference point return (G28/G30) are not -- these are
-    # documented FANUC lathe codes with real motion/state effects that
-    # this simulator deliberately hasn't modeled yet, so they still raise
-    # (unlike a totally foreign G-code, see the G88 test below).
-    with pytest.raises(UnsupportedFeatureError):
-        simulator.run(
-            """
-            G54;
-            M30;
-            """
-        )
+    # (G54-G59), reference point return (G28/G30), and programmable data
+    # input (G10, sets work/tool offsets) are not -- these are documented
+    # FANUC lathe codes with real motion/state effects that this
+    # simulator deliberately hasn't modeled yet, so they still raise
+    # (unlike a totally foreign G-code, see the G88 test below). G10 in
+    # particular was initially missing from this set entirely (so it fell
+    # through to the silent "totally unrecognized" skip instead) until a
+    # real NC file surfaced the gap -- silently skipping a work/tool
+    # offset assignment could send later moves to the wrong place.
+    for code in ("G54", "G10 L2 P1 X10.0 Z20.0"):
+        with pytest.raises(UnsupportedFeatureError):
+            simulator.run(f"{code};\nM30;\n")
 
 
 def test_totally_unrecognized_g_code_is_skipped_with_a_warning():
